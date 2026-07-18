@@ -24,6 +24,23 @@ pub enum Inst {
     /// it a function call; with rd=x0 the link is discarded and it is a plain jump.
     Jal { rd: usize, offset: i64 },
 
+    // --- RV64I branches (B-type) ---
+    // Compare rs1 with rs2 and, if the condition holds, jump pc-relative.
+    // No condition-code register in RISC-V: every branch does its own compare.
+    //
+    /// Branch if EQual: `if rs1 == rs2 { pc += offset }`.
+    Beq { rs1: usize, rs2: usize, offset: i64 },
+    /// Branch if Not Equal.
+    Bne { rs1: usize, rs2: usize, offset: i64 },
+    /// Branch if Less Than (signed compare).
+    Blt { rs1: usize, rs2: usize, offset: i64 },
+    /// Branch if Greater or Equal (signed compare).
+    Bge { rs1: usize, rs2: usize, offset: i64 },
+    /// Branch if Less Than, Unsigned.
+    Bltu { rs1: usize, rs2: usize, offset: i64 },
+    /// Branch if Greater or Equal, Unsigned.
+    Bgeu { rs1: usize, rs2: usize, offset: i64 },
+
     // --- Zicsr ---
     // All six atomically read the old CSR value into rd and combine a new value in.
     // The set/clear forms skip the write entirely when rs1/uimm is zero, so e.g.
@@ -52,6 +69,12 @@ impl std::fmt::Display for Inst {
             // objdump prints the raw upper-20-bit field, not the shifted value
             Inst::Auipc { rd, imm } => write!(f, "auipc x{rd}, {:#x}", (imm >> 12) & 0xfffff),
             Inst::Jal { rd, offset } => write!(f, "jal x{rd}, {offset}"),
+            Inst::Beq { rs1, rs2, offset } => write!(f, "beq x{rs1}, x{rs2}, {offset}"),
+            Inst::Bne { rs1, rs2, offset } => write!(f, "bne x{rs1}, x{rs2}, {offset}"),
+            Inst::Blt { rs1, rs2, offset } => write!(f, "blt x{rs1}, x{rs2}, {offset}"),
+            Inst::Bge { rs1, rs2, offset } => write!(f, "bge x{rs1}, x{rs2}, {offset}"),
+            Inst::Bltu { rs1, rs2, offset } => write!(f, "bltu x{rs1}, x{rs2}, {offset}"),
+            Inst::Bgeu { rs1, rs2, offset } => write!(f, "bgeu x{rs1}, x{rs2}, {offset}"),
             // CSRs are printed by number for now; a name table (mhartid, ...) can
             // come later when the Spike-diff tooling needs it.
             Inst::Csrrw { rd, rs1, csr } => write!(f, "csrrw x{rd}, {csr:#x}, x{rs1}"),
@@ -71,6 +94,7 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
     let opcode = raw & 0x7f;
     let rd = ((raw >> 7) & 0x1f) as usize;
     let rs1 = ((raw >> 15) & 0x1f) as usize;
+    let rs2 = ((raw >> 20) & 0x1f) as usize;
     let funct3 = (raw >> 12) & 0x7;
 
     match opcode {
@@ -81,6 +105,20 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
         },
         // AUIPC (U-type)
         0x17 => Ok(Inst::Auipc { rd, imm: imm_u(raw) }),
+        // BRANCH (B-type): funct3 selects the condition
+        0x63 => {
+            let offset = imm_b(raw);
+            match funct3 {
+                0x0 => Ok(Inst::Beq { rs1, rs2, offset }),
+                0x1 => Ok(Inst::Bne { rs1, rs2, offset }),
+                0x4 => Ok(Inst::Blt { rs1, rs2, offset }),
+                0x5 => Ok(Inst::Bge { rs1, rs2, offset }),
+                0x6 => Ok(Inst::Bltu { rs1, rs2, offset }),
+                0x7 => Ok(Inst::Bgeu { rs1, rs2, offset }),
+                // funct3 2 and 3 are unused in the BRANCH opcode
+                _ => Err(Exception::IllegalInstruction(raw)),
+            }
+        }
         // JAL (J-type)
         0x6f => Ok(Inst::Jal { rd, offset: imm_j(raw) }),
         // SYSTEM: the CSR instructions (Zicsr). funct3=0 hosts ECALL/EBREAK/MRET,
@@ -126,6 +164,20 @@ fn imm_i(raw: u32) -> i64 {
 /// U-type immediate: inst[31:12] << 12 (lower 12 bits zero), sign-extended.
 fn imm_u(raw: u32) -> i64 {
     (raw & 0xffff_f000) as i32 as i64
+}
+
+/// B-type immediate: 13 bits scattered as inst[31]=imm[12], inst[30:25]=imm[10:5],
+/// inst[11:8]=imm[4:1], inst[7]=imm[11]. Bit 0 is always zero, like J-type. This is
+/// the S-type (store) layout with the sign bit and bit 11 swapped in, so branches
+/// and stores share almost all their immediate wiring.
+fn imm_b(raw: u32) -> i64 {
+    let imm12 = ((raw >> 31) & 0x1) as u64;
+    let imm10_5 = ((raw >> 25) & 0x3f) as u64;
+    let imm4_1 = ((raw >> 8) & 0xf) as u64;
+    let imm11 = ((raw >> 7) & 0x1) as u64;
+    let imm = (imm12 << 12) | (imm11 << 11) | (imm10_5 << 5) | (imm4_1 << 1);
+    // Sign-extend from bit 12.
+    ((imm << 51) as i64) >> 51
 }
 
 /// J-type immediate: 21 bits scattered as inst[31]=imm[20], inst[30:21]=imm[10:1],
@@ -180,6 +232,30 @@ mod tests {
         assert_eq!(
             decode(0xffdff06f).unwrap(),
             Inst::Jal { rd: 0, offset: -4 }
+        );
+    }
+
+    #[test]
+    fn decodes_branches() {
+        // 0x03ff0863 = beq t5, t6, +0x30 (the tohost check loop in the test env)
+        assert_eq!(
+            decode(0x03ff0863).unwrap(),
+            Inst::Beq { rs1: 30, rs2: 31, offset: 0x30 }
+        );
+        // 0x4e771063 = bne a4, t2, +0x4e0 (jump to <fail>)
+        assert_eq!(
+            decode(0x4e771063).unwrap(),
+            Inst::Bne { rs1: 14, rs2: 7, offset: 0x4e0 }
+        );
+        // beq x1, x2, -8 (hand-assembled: backward branch → B-type sign extension)
+        assert_eq!(
+            decode(0xfe208ce3).unwrap(),
+            Inst::Beq { rs1: 1, rs2: 2, offset: -8 }
+        );
+        // funct3=2 is a hole in the BRANCH opcode
+        assert_eq!(
+            decode(0x00002063),
+            Err(Exception::IllegalInstruction(0x00002063))
         );
     }
 

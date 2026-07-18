@@ -77,6 +77,39 @@ impl Cpu {
                 self.regs[rd] = self.pc.wrapping_add(4); // link: return address
                 next_pc = self.pc.wrapping_add(offset as u64);
             }
+            // Branches: on a taken branch the offset replaces the straight-line
+            // next_pc. Signed conditions compare the same 64 bits reinterpreted
+            // as i64 — the register file itself has no notion of signedness.
+            Inst::Beq { rs1, rs2, offset } => {
+                if self.regs[rs1] == self.regs[rs2] {
+                    next_pc = self.pc.wrapping_add(offset as u64);
+                }
+            }
+            Inst::Bne { rs1, rs2, offset } => {
+                if self.regs[rs1] != self.regs[rs2] {
+                    next_pc = self.pc.wrapping_add(offset as u64);
+                }
+            }
+            Inst::Blt { rs1, rs2, offset } => {
+                if (self.regs[rs1] as i64) < (self.regs[rs2] as i64) {
+                    next_pc = self.pc.wrapping_add(offset as u64);
+                }
+            }
+            Inst::Bge { rs1, rs2, offset } => {
+                if (self.regs[rs1] as i64) >= (self.regs[rs2] as i64) {
+                    next_pc = self.pc.wrapping_add(offset as u64);
+                }
+            }
+            Inst::Bltu { rs1, rs2, offset } => {
+                if self.regs[rs1] < self.regs[rs2] {
+                    next_pc = self.pc.wrapping_add(offset as u64);
+                }
+            }
+            Inst::Bgeu { rs1, rs2, offset } => {
+                if self.regs[rs1] >= self.regs[rs2] {
+                    next_pc = self.pc.wrapping_add(offset as u64);
+                }
+            }
             // Zicsr: read the old value first, so rd == rs1 still gets the swap
             // semantics right. The "skip the write when the mask source is zero"
             // rule was already enforced at decode time (it is static), but the
@@ -191,6 +224,41 @@ mod tests {
         cpu.step().unwrap();
         assert_eq!(cpu.regs[1], DRAM_BASE + 4, "link register holds pc+4");
         assert_eq!(cpu.pc, DRAM_BASE + 8, "pc jumped by the offset");
+    }
+
+    #[test]
+    fn branch_taken_and_not_taken() {
+        // beq x1, x2, +8 = 0x00208463
+        let mut cpu = cpu_with_program(&[0x00208463]);
+        cpu.regs[1] = 7;
+        cpu.regs[2] = 7;
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, DRAM_BASE + 8, "equal → taken");
+
+        let mut cpu = cpu_with_program(&[0x00208463]);
+        cpu.regs[1] = 7;
+        cpu.regs[2] = 8;
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, DRAM_BASE + 4, "not equal → fall through");
+    }
+
+    #[test]
+    fn blt_is_signed_bltu_is_unsigned() {
+        // Same register contents, opposite outcomes:
+        // x1 = -1 as u64 (0xffff...ffff), x2 = 1.
+        // blt x1, x2, +8 = 0x0020c463 — signed: -1 < 1 → taken
+        let mut cpu = cpu_with_program(&[0x0020c463]);
+        cpu.regs[1] = (-1i64) as u64;
+        cpu.regs[2] = 1;
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, DRAM_BASE + 8, "signed: -1 < 1");
+
+        // bltu x1, x2, +8 = 0x0020e463 — unsigned: u64::MAX < 1 is false
+        let mut cpu = cpu_with_program(&[0x0020e463]);
+        cpu.regs[1] = (-1i64) as u64;
+        cpu.regs[2] = 1;
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, DRAM_BASE + 4, "unsigned: max < 1 is false");
     }
 
     /// Hand-assemble a SYSTEM/CSR instruction (funct3 picks the variant).
