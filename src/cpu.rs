@@ -197,6 +197,55 @@ impl Cpu {
                     next_pc = self.pc.wrapping_add(offset as u64);
                 }
             }
+            // Loads: address = rs1 + offset, then widen to 64 bits. The `as`
+            // casts pick sign- vs zero-extension exactly as in the W family.
+            // The `?` propagates access faults out of execute; pc is not
+            // committed in that case, which trap handling will rely on.
+            Inst::Lb { rd, rs1, offset } => {
+                let addr = self.regs[rs1].wrapping_add(offset as u64);
+                self.regs[rd] = self.bus.load8(addr)? as i8 as u64;
+            }
+            Inst::Lh { rd, rs1, offset } => {
+                let addr = self.regs[rs1].wrapping_add(offset as u64);
+                self.regs[rd] = self.bus.load16(addr)? as i16 as u64;
+            }
+            Inst::Lw { rd, rs1, offset } => {
+                let addr = self.regs[rs1].wrapping_add(offset as u64);
+                self.regs[rd] = self.bus.load32(addr)? as i32 as u64;
+            }
+            Inst::Lbu { rd, rs1, offset } => {
+                let addr = self.regs[rs1].wrapping_add(offset as u64);
+                self.regs[rd] = self.bus.load8(addr)? as u64;
+            }
+            Inst::Lhu { rd, rs1, offset } => {
+                let addr = self.regs[rs1].wrapping_add(offset as u64);
+                self.regs[rd] = self.bus.load16(addr)? as u64;
+            }
+            Inst::Lwu { rd, rs1, offset } => {
+                let addr = self.regs[rs1].wrapping_add(offset as u64);
+                self.regs[rd] = self.bus.load32(addr)? as u64;
+            }
+            Inst::Ld { rd, rs1, offset } => {
+                let addr = self.regs[rs1].wrapping_add(offset as u64);
+                self.regs[rd] = self.bus.load64(addr)?;
+            }
+            // Stores: truncate rs2 to the access width.
+            Inst::Sb { rs1, rs2, offset } => {
+                let addr = self.regs[rs1].wrapping_add(offset as u64);
+                self.bus.store8(addr, self.regs[rs2] as u8)?;
+            }
+            Inst::Sh { rs1, rs2, offset } => {
+                let addr = self.regs[rs1].wrapping_add(offset as u64);
+                self.bus.store16(addr, self.regs[rs2] as u16)?;
+            }
+            Inst::Sw { rs1, rs2, offset } => {
+                let addr = self.regs[rs1].wrapping_add(offset as u64);
+                self.bus.store32(addr, self.regs[rs2] as u32)?;
+            }
+            Inst::Sd { rs1, rs2, offset } => {
+                let addr = self.regs[rs1].wrapping_add(offset as u64);
+                self.bus.store64(addr, self.regs[rs2])?;
+            }
             // Zicsr: read the old value first, so rd == rs1 still gets the swap
             // semantics right. The "skip the write when the mask source is zero"
             // rule was already enforced at decode time (it is static), but the
@@ -435,6 +484,41 @@ mod tests {
         cpu.regs[3] = 1;
         cpu.step().unwrap();
         assert_eq!(cpu.regs[1], u64::MAX);
+    }
+
+    #[test]
+    fn load_sign_vs_zero_extension() {
+        // Memory byte 0x80: lb reads it as -128, lbu as +128.
+        // lb x1, 0(x2) = 0x00010083 / lbu x1, 0(x2) = 0x00014083
+        let mut cpu = cpu_with_program(&[0x00010083, 0x00014083]);
+        cpu.bus.store8(DRAM_BASE + 0x100, 0x80).unwrap();
+        cpu.regs[2] = DRAM_BASE + 0x100;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], (-128i64) as u64, "lb sign-extends");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], 128, "lbu zero-extends");
+    }
+
+    #[test]
+    fn narrow_store_truncates() {
+        // sb x3, 0(x2) = 0x00310023, then ld x1, 0(x2) = 0x00013083:
+        // only the low byte of x3 must reach memory.
+        let mut cpu = cpu_with_program(&[0x00310023, 0x00013083]);
+        cpu.regs[2] = DRAM_BASE + 0x200;
+        cpu.regs[3] = 0xaabb_ccdd_1122_3344;
+        cpu.step().unwrap();
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], 0x44);
+    }
+
+    #[test]
+    fn load_fault_leaves_pc_uncommitted() {
+        // ld x1, 0(x2) with x2 = 0: LoadAccessFault, and pc must still point
+        // at the faulting instruction (trap handling depends on this).
+        let mut cpu = cpu_with_program(&[0x00013083]);
+        cpu.regs[2] = 0;
+        assert_eq!(cpu.step(), Err(Exception::LoadAccessFault(0)));
+        assert_eq!(cpu.pc, DRAM_BASE);
     }
 
     #[test]

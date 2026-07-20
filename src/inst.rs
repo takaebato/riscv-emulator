@@ -112,6 +112,40 @@ pub enum Inst {
     /// Branch if Greater or Equal, Unsigned.
     Bgeu { rs1: usize, rs2: usize, offset: i64 },
 
+    // --- RV64I loads (I-type) ---
+    // `rd = mem[rs1 + offset]`, with the loaded value widened to 64 bits.
+    // The plain forms sign-extend (a C `int8_t`/`int16_t`/`int32_t` load);
+    // the U forms zero-extend (unsigned types). LD needs no LDU: 64 bits is
+    // already the full register.
+    //
+    /// Load Byte (sign-extended).
+    Lb { rd: usize, rs1: usize, offset: i64 },
+    /// Load Halfword (16 bits, sign-extended).
+    Lh { rd: usize, rs1: usize, offset: i64 },
+    /// Load Word (32 bits, sign-extended).
+    Lw { rd: usize, rs1: usize, offset: i64 },
+    /// Load Byte Unsigned (zero-extended).
+    Lbu { rd: usize, rs1: usize, offset: i64 },
+    /// Load Halfword Unsigned.
+    Lhu { rd: usize, rs1: usize, offset: i64 },
+    /// Load Word Unsigned.
+    Lwu { rd: usize, rs1: usize, offset: i64 },
+    /// Load Doubleword (64 bits).
+    Ld { rd: usize, rs1: usize, offset: i64 },
+
+    // --- RV64I stores (S-type) ---
+    // `mem[rs1 + offset] = low bits of rs2`. Narrow stores just truncate;
+    // there is no sign/zero-extension question on the way out.
+    //
+    /// Store Byte.
+    Sb { rs1: usize, rs2: usize, offset: i64 },
+    /// Store Halfword.
+    Sh { rs1: usize, rs2: usize, offset: i64 },
+    /// Store Word.
+    Sw { rs1: usize, rs2: usize, offset: i64 },
+    /// Store Doubleword.
+    Sd { rs1: usize, rs2: usize, offset: i64 },
+
     // --- Zicsr ---
     // All six atomically read the old CSR value into rd and combine a new value in.
     // The set/clear forms skip the write entirely when rs1/uimm is zero, so e.g.
@@ -185,6 +219,17 @@ impl std::fmt::Display for Inst {
             Inst::Bge { rs1, rs2, offset } => write!(f, "bge x{rs1}, x{rs2}, {offset}"),
             Inst::Bltu { rs1, rs2, offset } => write!(f, "bltu x{rs1}, x{rs2}, {offset}"),
             Inst::Bgeu { rs1, rs2, offset } => write!(f, "bgeu x{rs1}, x{rs2}, {offset}"),
+            Inst::Lb { rd, rs1, offset } => write!(f, "lb x{rd}, {offset}(x{rs1})"),
+            Inst::Lh { rd, rs1, offset } => write!(f, "lh x{rd}, {offset}(x{rs1})"),
+            Inst::Lw { rd, rs1, offset } => write!(f, "lw x{rd}, {offset}(x{rs1})"),
+            Inst::Lbu { rd, rs1, offset } => write!(f, "lbu x{rd}, {offset}(x{rs1})"),
+            Inst::Lhu { rd, rs1, offset } => write!(f, "lhu x{rd}, {offset}(x{rs1})"),
+            Inst::Lwu { rd, rs1, offset } => write!(f, "lwu x{rd}, {offset}(x{rs1})"),
+            Inst::Ld { rd, rs1, offset } => write!(f, "ld x{rd}, {offset}(x{rs1})"),
+            Inst::Sb { rs1, rs2, offset } => write!(f, "sb x{rs2}, {offset}(x{rs1})"),
+            Inst::Sh { rs1, rs2, offset } => write!(f, "sh x{rs2}, {offset}(x{rs1})"),
+            Inst::Sw { rs1, rs2, offset } => write!(f, "sw x{rs2}, {offset}(x{rs1})"),
+            Inst::Sd { rs1, rs2, offset } => write!(f, "sd x{rs2}, {offset}(x{rs1})"),
             // CSRs are printed by number for now; a name table (mhartid, ...) can
             // come later when the Spike-diff tooling needs it.
             Inst::Csrrw { rd, rs1, csr } => write!(f, "csrrw x{rd}, {csr:#x}, x{rs1}"),
@@ -210,6 +255,32 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
     let funct3 = (raw >> 12) & 0x7;
 
     match opcode {
+        // LOAD (I-type): funct3's low 2 bits are the width's log2, bit 2 selects
+        // zero-extension. (0x7 would be a 128-bit load; illegal on RV64.)
+        0x03 => {
+            let offset = imm_i(raw);
+            match funct3 {
+                0x0 => Ok(Inst::Lb { rd, rs1, offset }),
+                0x1 => Ok(Inst::Lh { rd, rs1, offset }),
+                0x2 => Ok(Inst::Lw { rd, rs1, offset }),
+                0x3 => Ok(Inst::Ld { rd, rs1, offset }),
+                0x4 => Ok(Inst::Lbu { rd, rs1, offset }),
+                0x5 => Ok(Inst::Lhu { rd, rs1, offset }),
+                0x6 => Ok(Inst::Lwu { rd, rs1, offset }),
+                _ => Err(Exception::IllegalInstruction(raw)),
+            }
+        }
+        // STORE (S-type)
+        0x23 => {
+            let offset = imm_s(raw);
+            match funct3 {
+                0x0 => Ok(Inst::Sb { rs1, rs2, offset }),
+                0x1 => Ok(Inst::Sh { rs1, rs2, offset }),
+                0x2 => Ok(Inst::Sw { rs1, rs2, offset }),
+                0x3 => Ok(Inst::Sd { rs1, rs2, offset }),
+                _ => Err(Exception::IllegalInstruction(raw)),
+            }
+        }
         // OP-IMM: register-immediate arithmetic (I-type)
         0x13 => {
             // Shift encodings: shamt in inst[25:20] (6 bits on RV64), the
@@ -341,6 +412,15 @@ fn imm_i(raw: u32) -> i64 {
 /// U-type immediate: inst[31:12] << 12 (lower 12 bits zero), sign-extended.
 fn imm_u(raw: u32) -> i64 {
     (raw & 0xffff_f000) as i32 as i64
+}
+
+/// S-type immediate: 12 bits split as inst[31:25]=imm[11:5] (the funct7 slot)
+/// and inst[11:7]=imm[4:0] (the rd slot, unused by stores). Same value range as
+/// I-type; only the placement differs, to keep rs2 at its fixed position.
+fn imm_s(raw: u32) -> i64 {
+    let imm11_5 = ((raw as i32) >> 25) as i64; // arithmetic shift: sign-extends
+    let imm4_0 = ((raw >> 7) & 0x1f) as i64;
+    (imm11_5 << 5) | imm4_0
 }
 
 /// B-type immediate: 13 bits scattered as inst[31]=imm[12], inst[30:25]=imm[10:5],
@@ -542,6 +622,43 @@ mod tests {
         assert_eq!(
             decode(0x00002063),
             Err(Exception::IllegalInstruction(0x00002063))
+        );
+    }
+
+    #[test]
+    fn decodes_loads() {
+        // Hand-assembled: ld x1, 8(x2) / lbu x1, 0(x2) / lw x1, -4(x2)
+        assert_eq!(
+            decode(0x00813083).unwrap(),
+            Inst::Ld { rd: 1, rs1: 2, offset: 8 }
+        );
+        assert_eq!(
+            decode(0x00014083).unwrap(),
+            Inst::Lbu { rd: 1, rs1: 2, offset: 0 }
+        );
+        assert_eq!(
+            decode(0xffc12083).unwrap(),
+            Inst::Lw { rd: 1, rs1: 2, offset: -4 }
+        );
+        // funct3=7 would be a 128-bit load: illegal on RV64
+        assert_eq!(
+            decode(0x00017083),
+            Err(Exception::IllegalInstruction(0x00017083))
+        );
+    }
+
+    #[test]
+    fn decodes_stores() {
+        // 0xfc3f2223 = sw gp, -60(t5) — the riscv-tests tohost result write
+        // (negative offset → S-type sign extension across the split fields)
+        assert_eq!(
+            decode(0xfc3f2223).unwrap(),
+            Inst::Sw { rs1: 30, rs2: 3, offset: -60 }
+        );
+        // Hand-assembled: sd x3, 16(x4)
+        assert_eq!(
+            decode(0x00323823).unwrap(),
+            Inst::Sd { rs1: 4, rs2: 3, offset: 16 }
         );
     }
 
