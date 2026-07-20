@@ -73,6 +73,33 @@ impl Cpu {
             Inst::Auipc { rd, imm } => {
                 self.regs[rd] = self.pc.wrapping_add(imm as u64);
             }
+            // Shifts: in Rust (as in the ISA) >> is logical on unsigned and
+            // arithmetic on signed, so the u64/i64 cast picks the semantics.
+            Inst::Slli { rd, rs1, shamt } => {
+                self.regs[rd] = self.regs[rs1] << shamt;
+            }
+            Inst::Srli { rd, rs1, shamt } => {
+                self.regs[rd] = self.regs[rs1] >> shamt;
+            }
+            Inst::Srai { rd, rs1, shamt } => {
+                self.regs[rd] = ((self.regs[rs1] as i64) >> shamt) as u64;
+            }
+            // W family: compute in 32 bits, then the `as i32 as u64` pair
+            // sign-extends the 32-bit result into the full register. Every
+            // W instruction ends with this same idiom.
+            Inst::Addiw { rd, rs1, imm } => {
+                let result = (self.regs[rs1] as u32).wrapping_add(imm as u32);
+                self.regs[rd] = result as i32 as u64;
+            }
+            Inst::Slliw { rd, rs1, shamt } => {
+                self.regs[rd] = ((self.regs[rs1] as u32) << shamt) as i32 as u64;
+            }
+            Inst::Srliw { rd, rs1, shamt } => {
+                self.regs[rd] = ((self.regs[rs1] as u32) >> shamt) as i32 as u64;
+            }
+            Inst::Sraiw { rd, rs1, shamt } => {
+                self.regs[rd] = ((self.regs[rs1] as i32) >> shamt) as u64;
+            }
             Inst::Jal { rd, offset } => {
                 self.regs[rd] = self.pc.wrapping_add(4); // link: return address
                 next_pc = self.pc.wrapping_add(offset as u64);
@@ -259,6 +286,53 @@ mod tests {
         cpu.regs[2] = 1;
         cpu.step().unwrap();
         assert_eq!(cpu.pc, DRAM_BASE + 4, "unsigned: max < 1 is false");
+    }
+
+    #[test]
+    fn srli_is_logical_srai_is_arithmetic() {
+        // x2 = -16: srli sees a huge unsigned number, srai divides by 4.
+        // srli x1, x2, 2 = 0x00215093 / srai x1, x2, 2 = 0x40215093
+        let mut cpu = cpu_with_program(&[0x00215093]);
+        cpu.regs[2] = (-16i64) as u64;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], (u64::MAX - 15) >> 2, "zeros shifted in");
+
+        let mut cpu = cpu_with_program(&[0x40215093]);
+        cpu.regs[2] = (-16i64) as u64;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], (-4i64) as u64, "sign bits shifted in: -16/4");
+    }
+
+    #[test]
+    fn li_idiom_builds_a_wide_constant() {
+        // The exact pair from rv64ui-p-add's constant setup:
+        //   addiw t0, zero, 1   (0x0010029b)
+        //   slli  t0, t0, 0x35  (0x03529293)  → t0 = 1 << 53
+        let mut cpu = cpu_with_program(&[0x0010029b, 0x03529293]);
+        cpu.step().unwrap();
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[5], 1u64 << 53);
+    }
+
+    #[test]
+    fn addiw_wraps_at_32_bits_and_sign_extends() {
+        // x1 = 0x7fff_ffff (i32::MAX); addiw x1, x1, 1 (0x0010809b) overflows the
+        // 32-bit world to i32::MIN, whose sign extension fills the upper half.
+        // A 64-bit addi would have produced 0x0000_0000_8000_0000 instead.
+        let mut cpu = cpu_with_program(&[0x0010809b]);
+        cpu.regs[1] = 0x7fff_ffff;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], 0xffff_ffff_8000_0000);
+    }
+
+    #[test]
+    fn sraiw_uses_bit_31_as_sign() {
+        // x2 = 0x0000_0000_8000_0000: positive as a 64-bit value, but its low
+        // 32 bits are i32::MIN. sraiw x1, x2, 4 (0x4041509b) must see the latter.
+        let mut cpu = cpu_with_program(&[0x4041509b]);
+        cpu.regs[2] = 0x8000_0000;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], 0xffff_ffff_f800_0000);
     }
 
     /// Hand-assemble a SYSTEM/CSR instruction (funct3 picks the variant).

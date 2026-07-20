@@ -24,6 +24,33 @@ pub enum Inst {
     /// it a function call; with rd=x0 the link is discarded and it is a plain jump.
     Jal { rd: usize, offset: i64 },
 
+    // --- RV64I OP-IMM shifts ---
+    // I-type with the immediate field repurposed: the low 6 bits are the shift
+    // amount (RV64; RV32 uses 5) and the leftover high bits act as funct6,
+    // telling the logical and arithmetic right shifts apart.
+    //
+    /// Shift Left Logical Immediate: `rd = rs1 << shamt`. Zeros shift in.
+    Slli { rd: usize, rs1: usize, shamt: u32 },
+    /// Shift Right Logical Immediate: `rd = rs1 >> shamt`. Zeros shift in.
+    Srli { rd: usize, rs1: usize, shamt: u32 },
+    /// Shift Right Arithmetic Immediate: `rd = (rs1 as i64) >> shamt`. Copies of
+    /// the sign bit shift in: division by 2^shamt rounding toward -infinity.
+    Srai { rd: usize, rs1: usize, shamt: u32 },
+
+    // --- RV64I OP-IMM-32 (the "W" family) ---
+    // Operate on the low 32 bits and sign-extend the 32-bit result to 64. This is
+    // what C's `int` arithmetic compiles to on RV64: a plain 64-bit add would leak
+    // carries into the upper half instead of wrapping at 32 bits.
+    //
+    /// ADD Immediate Word: 32-bit addi, result sign-extended to 64 bits.
+    Addiw { rd: usize, rs1: usize, imm: i64 },
+    /// Shift Left Logical Immediate Word (shamt is back to 5 bits).
+    Slliw { rd: usize, rs1: usize, shamt: u32 },
+    /// Shift Right Logical Immediate Word: zeros shift into bit 31.
+    Srliw { rd: usize, rs1: usize, shamt: u32 },
+    /// Shift Right Arithmetic Immediate Word: bit 31 (not 63) is the sign.
+    Sraiw { rd: usize, rs1: usize, shamt: u32 },
+
     // --- RV64I branches (B-type) ---
     // Compare rs1 with rs2 and, if the condition holds, jump pc-relative.
     // No condition-code register in RISC-V: every branch does its own compare.
@@ -69,6 +96,14 @@ impl std::fmt::Display for Inst {
             // objdump prints the raw upper-20-bit field, not the shifted value
             Inst::Auipc { rd, imm } => write!(f, "auipc x{rd}, {:#x}", (imm >> 12) & 0xfffff),
             Inst::Jal { rd, offset } => write!(f, "jal x{rd}, {offset}"),
+            // objdump prints shift amounts in hex
+            Inst::Slli { rd, rs1, shamt } => write!(f, "slli x{rd}, x{rs1}, {shamt:#x}"),
+            Inst::Srli { rd, rs1, shamt } => write!(f, "srli x{rd}, x{rs1}, {shamt:#x}"),
+            Inst::Srai { rd, rs1, shamt } => write!(f, "srai x{rd}, x{rs1}, {shamt:#x}"),
+            Inst::Addiw { rd, rs1, imm } => write!(f, "addiw x{rd}, x{rs1}, {imm}"),
+            Inst::Slliw { rd, rs1, shamt } => write!(f, "slliw x{rd}, x{rs1}, {shamt:#x}"),
+            Inst::Srliw { rd, rs1, shamt } => write!(f, "srliw x{rd}, x{rs1}, {shamt:#x}"),
+            Inst::Sraiw { rd, rs1, shamt } => write!(f, "sraiw x{rd}, x{rs1}, {shamt:#x}"),
             Inst::Beq { rs1, rs2, offset } => write!(f, "beq x{rs1}, x{rs2}, {offset}"),
             Inst::Bne { rs1, rs2, offset } => write!(f, "bne x{rs1}, x{rs2}, {offset}"),
             Inst::Blt { rs1, rs2, offset } => write!(f, "blt x{rs1}, x{rs2}, {offset}"),
@@ -99,10 +134,20 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
 
     match opcode {
         // OP-IMM: register-immediate arithmetic (I-type)
-        0x13 => match funct3 {
-            0x0 => Ok(Inst::Addi { rd, rs1, imm: imm_i(raw) }),
-            _ => Err(Exception::IllegalInstruction(raw)),
-        },
+        0x13 => {
+            // Shift encodings: shamt in inst[25:20] (6 bits on RV64), the
+            // remaining inst[31:26] is funct6. Only 000000 and 010000 (SRAI,
+            // reusing the bit-30 "alternate operation" convention) are valid.
+            let shamt = (raw >> 20) & 0x3f;
+            let funct6 = raw >> 26;
+            match (funct3, funct6) {
+                (0x0, _) => Ok(Inst::Addi { rd, rs1, imm: imm_i(raw) }),
+                (0x1, 0b000000) => Ok(Inst::Slli { rd, rs1, shamt }),
+                (0x5, 0b000000) => Ok(Inst::Srli { rd, rs1, shamt }),
+                (0x5, 0b010000) => Ok(Inst::Srai { rd, rs1, shamt }),
+                _ => Err(Exception::IllegalInstruction(raw)),
+            }
+        }
         // AUIPC (U-type)
         0x17 => Ok(Inst::Auipc { rd, imm: imm_u(raw) }),
         // BRANCH (B-type): funct3 selects the condition
@@ -116,6 +161,20 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
                 0x6 => Ok(Inst::Bltu { rs1, rs2, offset }),
                 0x7 => Ok(Inst::Bgeu { rs1, rs2, offset }),
                 // funct3 2 and 3 are unused in the BRANCH opcode
+                _ => Err(Exception::IllegalInstruction(raw)),
+            }
+        }
+        // OP-IMM-32: W-family register-immediate arithmetic (I-type)
+        0x1b => {
+            // W shifts are back to a 5-bit shamt, so the discriminator is a full
+            // funct7 again; a set bit 25 (shamt >= 32) is an illegal instruction.
+            let shamt = (raw >> 20) & 0x1f;
+            let funct7 = raw >> 25;
+            match (funct3, funct7) {
+                (0x0, _) => Ok(Inst::Addiw { rd, rs1, imm: imm_i(raw) }),
+                (0x1, 0b0000000) => Ok(Inst::Slliw { rd, rs1, shamt }),
+                (0x5, 0b0000000) => Ok(Inst::Srliw { rd, rs1, shamt }),
+                (0x5, 0b0100000) => Ok(Inst::Sraiw { rd, rs1, shamt }),
                 _ => Err(Exception::IllegalInstruction(raw)),
             }
         }
@@ -232,6 +291,58 @@ mod tests {
         assert_eq!(
             decode(0xffdff06f).unwrap(),
             Inst::Jal { rd: 0, offset: -4 }
+        );
+    }
+
+    #[test]
+    fn decodes_shifts() {
+        // 0x03529293 = slli t0, t0, 0x35 — shamt 53 > 31 exercises the 6-bit
+        // RV64 shamt field (this encoding is illegal on RV32).
+        assert_eq!(
+            decode(0x03529293).unwrap(),
+            Inst::Slli { rd: 5, rs1: 5, shamt: 0x35 }
+        );
+        // Hand-assembled: srli x1, x2, 4 / srai x1, x2, 4 (differ in bit 30 only)
+        assert_eq!(
+            decode(0x00415093).unwrap(),
+            Inst::Srli { rd: 1, rs1: 2, shamt: 4 }
+        );
+        assert_eq!(
+            decode(0x40415093).unwrap(),
+            Inst::Srai { rd: 1, rs1: 2, shamt: 4 }
+        );
+        // SLLI with the SRAI funct6 pattern (bit 30 set) is not a thing
+        assert_eq!(
+            decode(0x40411093),
+            Err(Exception::IllegalInstruction(0x40411093))
+        );
+    }
+
+    #[test]
+    fn decodes_w_family() {
+        // 0x0010029b = addiw t0, zero, 1 — the instruction that stopped the demo
+        assert_eq!(
+            decode(0x0010029b).unwrap(),
+            Inst::Addiw { rd: 5, rs1: 0, imm: 1 }
+        );
+        // 0xfff3839b = addiw t2, t2, -1 (sign-extended negative immediate)
+        assert_eq!(
+            decode(0xfff3839b).unwrap(),
+            Inst::Addiw { rd: 7, rs1: 7, imm: -1 }
+        );
+        // Hand-assembled: slliw x1, x2, 3 / sraiw x1, x2, 3
+        assert_eq!(
+            decode(0x0031109b).unwrap(),
+            Inst::Slliw { rd: 1, rs1: 2, shamt: 3 }
+        );
+        assert_eq!(
+            decode(0x4031509b).unwrap(),
+            Inst::Sraiw { rd: 1, rs1: 2, shamt: 3 }
+        );
+        // W shifts have a 5-bit shamt: bit 25 set (shamt 35) must not decode
+        assert_eq!(
+            decode(0x0231109b),
+            Err(Exception::IllegalInstruction(0x0231109b))
         );
     }
 
