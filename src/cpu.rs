@@ -6,6 +6,10 @@ use crate::exception::Exception;
 use crate::inst::{Inst, decode};
 use crate::loader::LoadedElf;
 
+/// CSR address of mepc (Machine Exception Program Counter): where a trap saves
+/// the interrupted pc, and where MRET returns to.
+const MEPC: usize = 0x341;
+
 pub struct Cpu {
     /// Integer registers x0..=x31. x0 is always 0 (enforced at the end of execute).
     pub regs: [u64; 32],
@@ -178,6 +182,12 @@ impl Cpu {
                 }
                 self.regs[rd] = old;
             }
+            // Minimal MRET: just the jump back to mepc. Restoring the privilege
+            // level and interrupt-enable state comes with phase 3, along with
+            // clearing the low bits of mepc (guaranteed aligned in practice here).
+            Inst::Mret => {
+                next_pc = self.csrs[MEPC];
+            }
         }
 
         // x0 is hardwired to zero: writes are allowed but never stick. Clearing it
@@ -333,6 +343,17 @@ mod tests {
         cpu.regs[2] = 0x8000_0000;
         cpu.step().unwrap();
         assert_eq!(cpu.regs[1], 0xffff_ffff_f800_0000);
+    }
+
+    #[test]
+    fn mret_jumps_to_mepc() {
+        // The riscv-tests startup idiom: write the test body's address into
+        // mepc, then mret into it. csrw mepc, t0 = 0x34129073.
+        let mut cpu = cpu_with_program(&[0x34129073, 0x30200073]);
+        cpu.regs[5] = DRAM_BASE + 0x100;
+        cpu.step().unwrap();
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, DRAM_BASE + 0x100);
     }
 
     /// Hand-assemble a SYSTEM/CSR instruction (funct3 picks the variant).

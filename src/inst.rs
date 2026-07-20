@@ -85,6 +85,14 @@ pub enum Inst {
     Csrrsi { rd: usize, uimm: u64, csr: usize },
     /// CSRRC with a 5-bit immediate bitmask.
     Csrrci { rd: usize, uimm: u64, csr: usize },
+
+    // --- Privileged (minimal, ahead of phase 3) ---
+    //
+    /// Machine-mode trap RETurn: `pc = mepc`. The full semantics also restore
+    /// the privilege level (from mstatus.MPP) and the interrupt-enable bit
+    /// (MIE from MPIE); those wait until phase 3 introduces privilege modes.
+    /// riscv-tests uses it at the end of startup to jump to the test body.
+    Mret,
 }
 
 impl std::fmt::Display for Inst {
@@ -118,6 +126,7 @@ impl std::fmt::Display for Inst {
             Inst::Csrrwi { rd, uimm, csr } => write!(f, "csrrwi x{rd}, {csr:#x}, {uimm}"),
             Inst::Csrrsi { rd, uimm, csr } => write!(f, "csrrsi x{rd}, {csr:#x}, {uimm}"),
             Inst::Csrrci { rd, uimm, csr } => write!(f, "csrrci x{rd}, {csr:#x}, {uimm}"),
+            Inst::Mret => write!(f, "mret"),
         }
     }
 }
@@ -201,6 +210,10 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
                 }
             };
             match funct3 {
+                // funct3=0 holds the zero-operand instructions, told apart by the
+                // whole word: every other field is a fixed constant. ECALL/EBREAK
+                // will join this arm with trap handling.
+                0x0 if raw == 0x30200073 => Ok(Inst::Mret),
                 0x1 => check(true, Inst::Csrrw { rd, rs1, csr }),
                 0x2 => check(rs1 != 0, Inst::Csrrs { rd, rs1, csr }),
                 0x3 => check(rs1 != 0, Inst::Csrrc { rd, rs1, csr }),
@@ -382,6 +395,21 @@ mod tests {
         assert_eq!(
             decode(0x30529073).unwrap(),
             Inst::Csrrw { rd: 0, rs1: 5, csr: 0x305 }
+        );
+    }
+
+    #[test]
+    fn decodes_mret() {
+        assert_eq!(decode(0x30200073).unwrap(), Inst::Mret);
+        // Same shape, different funct7: SRET (supervisor return) and WFI are
+        // not implemented yet and must stay illegal, not alias to MRET.
+        assert_eq!(
+            decode(0x10200073),
+            Err(Exception::IllegalInstruction(0x10200073))
+        );
+        assert_eq!(
+            decode(0x10500073),
+            Err(Exception::IllegalInstruction(0x10500073))
         );
     }
 
