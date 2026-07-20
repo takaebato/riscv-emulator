@@ -74,6 +74,9 @@ impl Cpu {
                 // arithmetic uses the wrapping_* family (avoids debug-build panics).
                 self.regs[rd] = self.regs[rs1].wrapping_add(imm as u64);
             }
+            Inst::Lui { rd, imm } => {
+                self.regs[rd] = imm as u64;
+            }
             Inst::Auipc { rd, imm } => {
                 self.regs[rd] = self.pc.wrapping_add(imm as u64);
             }
@@ -102,6 +105,59 @@ impl Cpu {
                 self.regs[rd] = ((self.regs[rs1] as u32) >> shamt) as i32 as u64;
             }
             Inst::Sraiw { rd, rs1, shamt } => {
+                self.regs[rd] = ((self.regs[rs1] as i32) >> shamt) as u64;
+            }
+            // OP: same operations as OP-IMM but the second operand comes from a
+            // register. Register shifts read their amount from the low 6 bits of
+            // rs2 (5 for the W forms); the upper bits are ignored, not an error.
+            Inst::Add { rd, rs1, rs2 } => {
+                self.regs[rd] = self.regs[rs1].wrapping_add(self.regs[rs2]);
+            }
+            Inst::Sub { rd, rs1, rs2 } => {
+                self.regs[rd] = self.regs[rs1].wrapping_sub(self.regs[rs2]);
+            }
+            Inst::Sll { rd, rs1, rs2 } => {
+                self.regs[rd] = self.regs[rs1] << (self.regs[rs2] & 0x3f);
+            }
+            Inst::Slt { rd, rs1, rs2 } => {
+                self.regs[rd] = ((self.regs[rs1] as i64) < (self.regs[rs2] as i64)) as u64;
+            }
+            Inst::Sltu { rd, rs1, rs2 } => {
+                self.regs[rd] = (self.regs[rs1] < self.regs[rs2]) as u64;
+            }
+            Inst::Xor { rd, rs1, rs2 } => {
+                self.regs[rd] = self.regs[rs1] ^ self.regs[rs2];
+            }
+            Inst::Srl { rd, rs1, rs2 } => {
+                self.regs[rd] = self.regs[rs1] >> (self.regs[rs2] & 0x3f);
+            }
+            Inst::Sra { rd, rs1, rs2 } => {
+                self.regs[rd] = ((self.regs[rs1] as i64) >> (self.regs[rs2] & 0x3f)) as u64;
+            }
+            Inst::Or { rd, rs1, rs2 } => {
+                self.regs[rd] = self.regs[rs1] | self.regs[rs2];
+            }
+            Inst::And { rd, rs1, rs2 } => {
+                self.regs[rd] = self.regs[rs1] & self.regs[rs2];
+            }
+            Inst::Addw { rd, rs1, rs2 } => {
+                let result = (self.regs[rs1] as u32).wrapping_add(self.regs[rs2] as u32);
+                self.regs[rd] = result as i32 as u64;
+            }
+            Inst::Subw { rd, rs1, rs2 } => {
+                let result = (self.regs[rs1] as u32).wrapping_sub(self.regs[rs2] as u32);
+                self.regs[rd] = result as i32 as u64;
+            }
+            Inst::Sllw { rd, rs1, rs2 } => {
+                let shamt = self.regs[rs2] & 0x1f;
+                self.regs[rd] = ((self.regs[rs1] as u32) << shamt) as i32 as u64;
+            }
+            Inst::Srlw { rd, rs1, rs2 } => {
+                let shamt = self.regs[rs2] & 0x1f;
+                self.regs[rd] = ((self.regs[rs1] as u32) >> shamt) as i32 as u64;
+            }
+            Inst::Sraw { rd, rs1, rs2 } => {
+                let shamt = self.regs[rs2] & 0x1f;
                 self.regs[rd] = ((self.regs[rs1] as i32) >> shamt) as u64;
             }
             Inst::Jal { rd, offset } => {
@@ -182,6 +238,8 @@ impl Cpu {
                 }
                 self.regs[rd] = old;
             }
+            // No-op on this in-order single-hart interpreter (see the enum doc).
+            Inst::Fence => {}
             // Minimal MRET: just the jump back to mepc. Restoring the privilege
             // level and interrupt-enable state comes with phase 3, along with
             // clearing the low bits of mepc (guaranteed aligned in practice here).
@@ -343,6 +401,40 @@ mod tests {
         cpu.regs[2] = 0x8000_0000;
         cpu.step().unwrap();
         assert_eq!(cpu.regs[1], 0xffff_ffff_f800_0000);
+    }
+
+    #[test]
+    fn slt_materializes_comparisons() {
+        // x2 = -1, x3 = 1: signed says less, unsigned says greater.
+        // slt x1, x2, x3 = 0x003120b3 / sltu x1, x2, x3 = 0x003130b3
+        let mut cpu = cpu_with_program(&[0x003120b3, 0x003130b3]);
+        cpu.regs[2] = (-1i64) as u64;
+        cpu.regs[3] = 1;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], 1, "signed: -1 < 1");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], 0, "unsigned: u64::MAX < 1 is false");
+    }
+
+    #[test]
+    fn register_shift_amount_uses_low_6_bits() {
+        // sll x1, x2, x3 = 0x003110b3 with x3 = 65: only 65 & 0x3f = 1 counts.
+        let mut cpu = cpu_with_program(&[0x003110b3]);
+        cpu.regs[2] = 0x10;
+        cpu.regs[3] = 65;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], 0x20, "shifted by 1, not by 65");
+    }
+
+    #[test]
+    fn subw_wraps_and_sign_extends() {
+        // subw x1, x2, x3 = 0x403100bb with 0 - 1: the 32-bit result 0xffffffff
+        // sign-extends to a full 64-bit -1.
+        let mut cpu = cpu_with_program(&[0x403100bb]);
+        cpu.regs[2] = 0;
+        cpu.regs[3] = 1;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], u64::MAX);
     }
 
     #[test]

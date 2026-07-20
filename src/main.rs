@@ -4,7 +4,7 @@
 use riscv_emulator::{cpu::Cpu, inst, loader};
 
 /// Safety cap so a legal infinite loop cannot hang the demo.
-const STEP_LIMIT: u64 = 100;
+const STEP_LIMIT: u64 = 10_000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()

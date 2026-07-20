@@ -17,6 +17,10 @@ pub enum Inst {
     /// ADD Immediate: `rd = rs1 + imm`. Also the workhorse behind the `li` (load
     /// immediate, rs1=x0), `mv` (rd = rs1, imm=0) and `nop` pseudo-instructions.
     Addi { rd: usize, rs1: usize, imm: i64 },
+    /// Load Upper Immediate: `rd = imm << 12`. Places the upper 20 bits of a
+    /// constant; a following I-type instruction supplies the (signed) low 12,
+    /// so the pair covers any sign-extended 32-bit value.
+    Lui { rd: usize, imm: i64 },
     /// Add Upper Immediate to PC: `rd = pc + (imm << 12)`. Builds pc-relative
     /// addresses (the upper 20 bits; a following addi/load supplies the low 12).
     Auipc { rd: usize, imm: i64 },
@@ -50,6 +54,46 @@ pub enum Inst {
     Srliw { rd: usize, rs1: usize, shamt: u32 },
     /// Shift Right Arithmetic Immediate Word: bit 31 (not 63) is the sign.
     Sraiw { rd: usize, rs1: usize, shamt: u32 },
+
+    // --- RV64I OP (R-type): register-register arithmetic ---
+    // funct3 picks one of eight operations; bit 30 of funct7 flips ADD to SUB
+    // and SRL to SRA, the same "alternate operation" bit as in the shifts above.
+    // Register shifts take their amount from the low 6 bits of rs2 (5 for W).
+    //
+    /// `rd = rs1 + rs2`.
+    Add { rd: usize, rs1: usize, rs2: usize },
+    /// `rd = rs1 - rs2`.
+    Sub { rd: usize, rs1: usize, rs2: usize },
+    /// Shift Left Logical: `rd = rs1 << rs2`.
+    Sll { rd: usize, rs1: usize, rs2: usize },
+    /// Set Less Than (signed): `rd = if rs1 < rs2 { 1 } else { 0 }`. Materializes
+    /// a comparison as a value, complementing the fused compare-and-branch.
+    Slt { rd: usize, rs1: usize, rs2: usize },
+    /// Set Less Than Unsigned.
+    Sltu { rd: usize, rs1: usize, rs2: usize },
+    /// `rd = rs1 ^ rs2`.
+    Xor { rd: usize, rs1: usize, rs2: usize },
+    /// Shift Right Logical: `rd = rs1 >> rs2`.
+    Srl { rd: usize, rs1: usize, rs2: usize },
+    /// Shift Right Arithmetic: `rd = (rs1 as i64) >> rs2`.
+    Sra { rd: usize, rs1: usize, rs2: usize },
+    /// `rd = rs1 | rs2`.
+    Or { rd: usize, rs1: usize, rs2: usize },
+    /// `rd = rs1 & rs2`.
+    And { rd: usize, rs1: usize, rs2: usize },
+
+    // --- RV64I OP-32: the register-register W family ---
+    //
+    /// 32-bit add, result sign-extended to 64 bits.
+    Addw { rd: usize, rs1: usize, rs2: usize },
+    /// 32-bit subtract, result sign-extended.
+    Subw { rd: usize, rs1: usize, rs2: usize },
+    /// 32-bit shift left (amount from rs2's low 5 bits).
+    Sllw { rd: usize, rs1: usize, rs2: usize },
+    /// 32-bit logical shift right.
+    Srlw { rd: usize, rs1: usize, rs2: usize },
+    /// 32-bit arithmetic shift right (bit 31 is the sign).
+    Sraw { rd: usize, rs1: usize, rs2: usize },
 
     // --- RV64I branches (B-type) ---
     // Compare rs1 with rs2 and, if the condition holds, jump pc-relative.
@@ -86,6 +130,13 @@ pub enum Inst {
     /// CSRRC with a 5-bit immediate bitmask.
     Csrrci { rd: usize, uimm: u64, csr: usize },
 
+    // --- Memory ordering ---
+    //
+    /// FENCE: order memory accesses as seen by other harts/devices. The pred and
+    /// succ masks (which access kinds to order) are not stored: this emulator
+    /// executes in program order on a single hart, so every fence is a no-op.
+    Fence,
+
     // --- Privileged (minimal, ahead of phase 3) ---
     //
     /// Machine-mode trap RETurn: `pc = mepc`. The full semantics also restore
@@ -102,6 +153,7 @@ impl std::fmt::Display for Inst {
         match *self {
             Inst::Addi { rd, rs1, imm } => write!(f, "addi x{rd}, x{rs1}, {imm}"),
             // objdump prints the raw upper-20-bit field, not the shifted value
+            Inst::Lui { rd, imm } => write!(f, "lui x{rd}, {:#x}", (imm >> 12) & 0xfffff),
             Inst::Auipc { rd, imm } => write!(f, "auipc x{rd}, {:#x}", (imm >> 12) & 0xfffff),
             Inst::Jal { rd, offset } => write!(f, "jal x{rd}, {offset}"),
             // objdump prints shift amounts in hex
@@ -112,6 +164,21 @@ impl std::fmt::Display for Inst {
             Inst::Slliw { rd, rs1, shamt } => write!(f, "slliw x{rd}, x{rs1}, {shamt:#x}"),
             Inst::Srliw { rd, rs1, shamt } => write!(f, "srliw x{rd}, x{rs1}, {shamt:#x}"),
             Inst::Sraiw { rd, rs1, shamt } => write!(f, "sraiw x{rd}, x{rs1}, {shamt:#x}"),
+            Inst::Add { rd, rs1, rs2 } => write!(f, "add x{rd}, x{rs1}, x{rs2}"),
+            Inst::Sub { rd, rs1, rs2 } => write!(f, "sub x{rd}, x{rs1}, x{rs2}"),
+            Inst::Sll { rd, rs1, rs2 } => write!(f, "sll x{rd}, x{rs1}, x{rs2}"),
+            Inst::Slt { rd, rs1, rs2 } => write!(f, "slt x{rd}, x{rs1}, x{rs2}"),
+            Inst::Sltu { rd, rs1, rs2 } => write!(f, "sltu x{rd}, x{rs1}, x{rs2}"),
+            Inst::Xor { rd, rs1, rs2 } => write!(f, "xor x{rd}, x{rs1}, x{rs2}"),
+            Inst::Srl { rd, rs1, rs2 } => write!(f, "srl x{rd}, x{rs1}, x{rs2}"),
+            Inst::Sra { rd, rs1, rs2 } => write!(f, "sra x{rd}, x{rs1}, x{rs2}"),
+            Inst::Or { rd, rs1, rs2 } => write!(f, "or x{rd}, x{rs1}, x{rs2}"),
+            Inst::And { rd, rs1, rs2 } => write!(f, "and x{rd}, x{rs1}, x{rs2}"),
+            Inst::Addw { rd, rs1, rs2 } => write!(f, "addw x{rd}, x{rs1}, x{rs2}"),
+            Inst::Subw { rd, rs1, rs2 } => write!(f, "subw x{rd}, x{rs1}, x{rs2}"),
+            Inst::Sllw { rd, rs1, rs2 } => write!(f, "sllw x{rd}, x{rs1}, x{rs2}"),
+            Inst::Srlw { rd, rs1, rs2 } => write!(f, "srlw x{rd}, x{rs1}, x{rs2}"),
+            Inst::Sraw { rd, rs1, rs2 } => write!(f, "sraw x{rd}, x{rs1}, x{rs2}"),
             Inst::Beq { rs1, rs2, offset } => write!(f, "beq x{rs1}, x{rs2}, {offset}"),
             Inst::Bne { rs1, rs2, offset } => write!(f, "bne x{rs1}, x{rs2}, {offset}"),
             Inst::Blt { rs1, rs2, offset } => write!(f, "blt x{rs1}, x{rs2}, {offset}"),
@@ -126,6 +193,7 @@ impl std::fmt::Display for Inst {
             Inst::Csrrwi { rd, uimm, csr } => write!(f, "csrrwi x{rd}, {csr:#x}, {uimm}"),
             Inst::Csrrsi { rd, uimm, csr } => write!(f, "csrrsi x{rd}, {csr:#x}, {uimm}"),
             Inst::Csrrci { rd, uimm, csr } => write!(f, "csrrci x{rd}, {csr:#x}, {uimm}"),
+            Inst::Fence => write!(f, "fence"),
             Inst::Mret => write!(f, "mret"),
         }
     }
@@ -159,6 +227,8 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
         }
         // AUIPC (U-type)
         0x17 => Ok(Inst::Auipc { rd, imm: imm_u(raw) }),
+        // LUI (U-type)
+        0x37 => Ok(Inst::Lui { rd, imm: imm_u(raw) }),
         // BRANCH (B-type): funct3 selects the condition
         0x63 => {
             let offset = imm_b(raw);
@@ -170,6 +240,36 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
                 0x6 => Ok(Inst::Bltu { rs1, rs2, offset }),
                 0x7 => Ok(Inst::Bgeu { rs1, rs2, offset }),
                 // funct3 2 and 3 are unused in the BRANCH opcode
+                _ => Err(Exception::IllegalInstruction(raw)),
+            }
+        }
+        // OP: register-register arithmetic (R-type)
+        0x33 => {
+            let funct7 = raw >> 25;
+            match (funct3, funct7) {
+                (0x0, 0b0000000) => Ok(Inst::Add { rd, rs1, rs2 }),
+                (0x0, 0b0100000) => Ok(Inst::Sub { rd, rs1, rs2 }),
+                (0x1, 0b0000000) => Ok(Inst::Sll { rd, rs1, rs2 }),
+                (0x2, 0b0000000) => Ok(Inst::Slt { rd, rs1, rs2 }),
+                (0x3, 0b0000000) => Ok(Inst::Sltu { rd, rs1, rs2 }),
+                (0x4, 0b0000000) => Ok(Inst::Xor { rd, rs1, rs2 }),
+                (0x5, 0b0000000) => Ok(Inst::Srl { rd, rs1, rs2 }),
+                (0x5, 0b0100000) => Ok(Inst::Sra { rd, rs1, rs2 }),
+                (0x6, 0b0000000) => Ok(Inst::Or { rd, rs1, rs2 }),
+                (0x7, 0b0000000) => Ok(Inst::And { rd, rs1, rs2 }),
+                // funct7 = 0000001 is the M extension (MUL/DIV), phase 2
+                _ => Err(Exception::IllegalInstruction(raw)),
+            }
+        }
+        // OP-32: register-register W family (R-type)
+        0x3b => {
+            let funct7 = raw >> 25;
+            match (funct3, funct7) {
+                (0x0, 0b0000000) => Ok(Inst::Addw { rd, rs1, rs2 }),
+                (0x0, 0b0100000) => Ok(Inst::Subw { rd, rs1, rs2 }),
+                (0x1, 0b0000000) => Ok(Inst::Sllw { rd, rs1, rs2 }),
+                (0x5, 0b0000000) => Ok(Inst::Srlw { rd, rs1, rs2 }),
+                (0x5, 0b0100000) => Ok(Inst::Sraw { rd, rs1, rs2 }),
                 _ => Err(Exception::IllegalInstruction(raw)),
             }
         }
@@ -187,6 +287,11 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
                 _ => Err(Exception::IllegalInstruction(raw)),
             }
         }
+        // MISC-MEM: FENCE (funct3=0). FENCE.I (funct3=1, Zifencei) comes later.
+        0x0f => match funct3 {
+            0x0 => Ok(Inst::Fence),
+            _ => Err(Exception::IllegalInstruction(raw)),
+        },
         // JAL (J-type)
         0x6f => Ok(Inst::Jal { rd, offset: imm_j(raw) }),
         // SYSTEM: the CSR instructions (Zicsr). funct3=0 hosts ECALL/EBREAK/MRET,
@@ -294,6 +399,16 @@ mod tests {
     }
 
     #[test]
+    fn decodes_lui() {
+        // 0xffff8637 = lui a2, 0xffff8 — on RV64 the 32-bit value 0xffff8000
+        // is further sign-extended to 64 bits.
+        assert_eq!(
+            decode(0xffff8637).unwrap(),
+            Inst::Lui { rd: 12, imm: 0xffff_8000u32 as i32 as i64 }
+        );
+    }
+
+    #[test]
     fn decodes_jal() {
         // 0x0500006f = jal x0, +0x50 (the very first instruction of rv64ui-p-add)
         assert_eq!(
@@ -356,6 +471,53 @@ mod tests {
         assert_eq!(
             decode(0x0231109b),
             Err(Exception::IllegalInstruction(0x0231109b))
+        );
+    }
+
+    #[test]
+    fn decodes_op() {
+        // 0x00c58733 = add a4, a1, a2 — where the demo stopped
+        assert_eq!(
+            decode(0x00c58733).unwrap(),
+            Inst::Add { rd: 14, rs1: 11, rs2: 12 }
+        );
+        // sub is add with bit 30 set
+        assert_eq!(
+            decode(0x40c58733).unwrap(),
+            Inst::Sub { rd: 14, rs1: 11, rs2: 12 }
+        );
+        // Hand-assembled: sltu x1, x2, x3 / sra x1, x2, x3
+        assert_eq!(
+            decode(0x003130b3).unwrap(),
+            Inst::Sltu { rd: 1, rs1: 2, rs2: 3 }
+        );
+        assert_eq!(
+            decode(0x403150b3).unwrap(),
+            Inst::Sra { rd: 1, rs1: 2, rs2: 3 }
+        );
+        // funct7 = 0000001 marks the M extension (this word is mul x1, x2, x3);
+        // it must stay illegal until phase 2
+        assert_eq!(
+            decode(0x023100b3),
+            Err(Exception::IllegalInstruction(0x023100b3))
+        );
+    }
+
+    #[test]
+    fn decodes_op_32() {
+        // Hand-assembled: addw/subw a4, a1, a2
+        assert_eq!(
+            decode(0x00c5873b).unwrap(),
+            Inst::Addw { rd: 14, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode(0x40c5873b).unwrap(),
+            Inst::Subw { rd: 14, rs1: 11, rs2: 12 }
+        );
+        // OP-32 has no logic/compare ops: AND's funct3 slot is a hole here
+        assert_eq!(
+            decode(0x00c5f73b),
+            Err(Exception::IllegalInstruction(0x00c5f73b))
         );
     }
 
