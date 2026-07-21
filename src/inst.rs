@@ -164,6 +164,17 @@ pub enum Inst {
     /// CSRRC with a 5-bit immediate bitmask.
     Csrrci { rd: usize, uimm: u64, csr: usize },
 
+    // --- Environment (SYSTEM, funct3=0) ---
+    //
+    /// Environment CALL: request a service from the execution environment by
+    /// raising an exception (cause 11 from M-mode). What the "service" is
+    /// belongs to the handler: an OS sees a syscall, riscv-tests sees "test
+    /// finished, result is in gp".
+    Ecall,
+    /// Environment BREAK: raise a breakpoint exception (cause 3). Debuggers
+    /// plant this word to regain control at a chosen spot.
+    Ebreak,
+
     // --- Memory ordering ---
     //
     /// FENCE: order memory accesses as seen by other harts/devices. The pred and
@@ -238,6 +249,8 @@ impl std::fmt::Display for Inst {
             Inst::Csrrwi { rd, uimm, csr } => write!(f, "csrrwi x{rd}, {csr:#x}, {uimm}"),
             Inst::Csrrsi { rd, uimm, csr } => write!(f, "csrrsi x{rd}, {csr:#x}, {uimm}"),
             Inst::Csrrci { rd, uimm, csr } => write!(f, "csrrci x{rd}, {csr:#x}, {uimm}"),
+            Inst::Ecall => write!(f, "ecall"),
+            Inst::Ebreak => write!(f, "ebreak"),
             Inst::Fence => write!(f, "fence"),
             Inst::Mret => write!(f, "mret"),
         }
@@ -387,8 +400,9 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
             };
             match funct3 {
                 // funct3=0 holds the zero-operand instructions, told apart by the
-                // whole word: every other field is a fixed constant. ECALL/EBREAK
-                // will join this arm with trap handling.
+                // whole word: every other field is a fixed constant.
+                0x0 if raw == 0x00000073 => Ok(Inst::Ecall),
+                0x0 if raw == 0x00100073 => Ok(Inst::Ebreak),
                 0x0 if raw == 0x30200073 => Ok(Inst::Mret),
                 0x1 => check(true, Inst::Csrrw { rd, rs1, csr }),
                 0x2 => check(rs1 != 0, Inst::Csrrs { rd, rs1, csr }),
@@ -675,6 +689,12 @@ mod tests {
             decode(0x30529073).unwrap(),
             Inst::Csrrw { rd: 0, rs1: 5, csr: 0x305 }
         );
+    }
+
+    #[test]
+    fn decodes_ecall_and_ebreak() {
+        assert_eq!(decode(0x00000073).unwrap(), Inst::Ecall);
+        assert_eq!(decode(0x00100073).unwrap(), Inst::Ebreak);
     }
 
     #[test]

@@ -6,9 +6,16 @@ use crate::exception::Exception;
 use crate::inst::{Inst, decode};
 use crate::loader::LoadedElf;
 
+/// CSR address of mtvec (Machine Trap VECtor): where traps jump to.
+const MTVEC: usize = 0x305;
 /// CSR address of mepc (Machine Exception Program Counter): where a trap saves
 /// the interrupted pc, and where MRET returns to.
 const MEPC: usize = 0x341;
+/// CSR address of mcause: why the last trap was taken.
+const MCAUSE: usize = 0x342;
+/// CSR address of mtval (Machine Trap VALue): extra evidence about the trap
+/// (faulting address, offending instruction word, ...).
+const MTVAL: usize = 0x343;
 
 pub struct Cpu {
     /// Integer registers x0..=x31. x0 is always 0 (enforced at the end of execute).
@@ -58,6 +65,27 @@ impl Cpu {
         let raw = self.fetch()?;
         let inst = decode(raw)?;
         self.execute(inst)
+    }
+
+    /// Take a trap: record what happened in the CSRs and redirect pc to the
+    /// handler. `self.pc` must still point at the instruction that trapped
+    /// (execute guarantees this: pc is only committed on success).
+    ///
+    /// Still missing for phase 3: the mstatus MIE/MPIE/MPP shuffle (interrupt
+    /// masking and privilege tracking) that MRET will then undo.
+    pub fn trap(&mut self, e: &Exception) {
+        self.csrs[MEPC] = self.pc;
+        self.csrs[MCAUSE] = e.cause();
+        self.csrs[MTVAL] = match e {
+            // The spec puts the address of the EBREAK itself in mtval; only
+            // the dispatcher knows the pc, so it is filled in here.
+            Exception::Breakpoint => self.pc,
+            _ => e.tval(),
+        };
+        // The low 2 bits of mtvec select direct vs vectored mode. Vectored
+        // only affects interrupts (pc = base + 4 * cause); exceptions always
+        // enter at base, so masking the mode bits off is correct here.
+        self.pc = self.csrs[MTVEC] & !0b11;
     }
 
     /// Execute one decoded instruction: update registers and advance pc.
@@ -286,6 +314,17 @@ impl Cpu {
                     self.csrs[csr] = old & !uimm;
                 }
                 self.regs[rd] = old;
+            }
+            // ECALL/EBREAK do not compute: raising the exception is their whole
+            // semantics. trap() sets pc itself, so return before the commit
+            // at the bottom would overwrite it with next_pc.
+            Inst::Ecall => {
+                self.trap(&Exception::EnvironmentCallFromMMode);
+                return Ok(());
+            }
+            Inst::Ebreak => {
+                self.trap(&Exception::Breakpoint);
+                return Ok(());
             }
             // No-op on this in-order single-hart interpreter (see the enum doc).
             Inst::Fence => {}
@@ -519,6 +558,25 @@ mod tests {
         cpu.regs[2] = 0;
         assert_eq!(cpu.step(), Err(Exception::LoadAccessFault(0)));
         assert_eq!(cpu.pc, DRAM_BASE);
+    }
+
+    #[test]
+    fn ecall_traps_to_mtvec() {
+        let mut cpu = cpu_with_program(&[0x00000073]);
+        cpu.csrs[MTVEC] = DRAM_BASE + 0x40;
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, DRAM_BASE + 0x40, "entered the handler");
+        assert_eq!(cpu.csrs[MEPC], DRAM_BASE, "mepc points at the ecall itself");
+        assert_eq!(cpu.csrs[MCAUSE], 11, "environment call from M-mode");
+    }
+
+    #[test]
+    fn ebreak_records_its_pc_in_mtval() {
+        let mut cpu = cpu_with_program(&[0x00100073]);
+        cpu.csrs[MTVEC] = DRAM_BASE + 0x40;
+        cpu.step().unwrap();
+        assert_eq!(cpu.csrs[MCAUSE], 3, "breakpoint");
+        assert_eq!(cpu.csrs[MTVAL], DRAM_BASE, "mtval holds the ebreak's address");
     }
 
     #[test]
