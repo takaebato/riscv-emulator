@@ -200,6 +200,12 @@ pub enum Inst {
     /// succ masks (which access kinds to order) are not stored: this emulator
     /// executes in program order on a single hart, so every fence is a no-op.
     Fence,
+    /// FENCE.I (Zifencei extension): make instruction fetches see all stores
+    /// this hart has already performed — the barrier self-modifying code runs
+    /// after patching itself. Real hardware flushes the instruction cache /
+    /// pipeline here; this interpreter fetches every instruction straight
+    /// from memory, so fetches are always coherent and the fence is a no-op.
+    FenceI,
 
     // --- Privileged (minimal, ahead of phase 3) ---
     //
@@ -277,6 +283,7 @@ impl std::fmt::Display for Inst {
             Inst::Ecall => write!(f, "ecall"),
             Inst::Ebreak => write!(f, "ebreak"),
             Inst::Fence => write!(f, "fence"),
+            Inst::FenceI => write!(f, "fence.i"),
             Inst::Mret => write!(f, "mret"),
         }
     }
@@ -403,9 +410,12 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
                 _ => Err(Exception::IllegalInstruction(raw)),
             }
         }
-        // MISC-MEM: FENCE (funct3=0). FENCE.I (funct3=1, Zifencei) comes later.
+        // MISC-MEM: FENCE (funct3=0) and FENCE.I (funct3=1, Zifencei). Their
+        // rd/rs1/imm fields are reserved for finer-grained fences; the spec
+        // tells implementations to ignore them, so only funct3 is inspected.
         0x0f => match funct3 {
             0x0 => Ok(Inst::Fence),
+            0x1 => Ok(Inst::FenceI),
             _ => Err(Exception::IllegalInstruction(raw)),
         },
         // JALR (I-type): the only instruction on its opcode, so funct3 must be 0
@@ -792,6 +802,27 @@ mod tests {
         assert_eq!(
             decode_checked(0b0000000_00011_00100_011_10000_0100011, 0x00323823).unwrap(),
             Inst::Sd { rs1: 4, rs2: 3, offset: 16 }
+        );
+    }
+
+    #[test]
+    fn decodes_fences() {
+        // MISC-MEM: fm_pred_succ_rs1_funct3_rd_opcode
+        // fence iorw, iorw — as emitted by riscv-tests: pred and succ both
+        // name all four access kinds (i/o/r/w), fm = 0000.
+        assert_eq!(
+            decode_checked(0b0000_1111_1111_00000_000_00000_0001111, 0x0ff0000f).unwrap(),
+            Inst::Fence
+        );
+        // fence.i (Zifencei): funct3=1, every other field zero (reserved).
+        assert_eq!(
+            decode_checked(0b0000_0000_0000_00000_001_00000_0001111, 0x0000100f).unwrap(),
+            Inst::FenceI
+        );
+        // funct3=2 has no fence assigned
+        assert_eq!(
+            decode_checked(0b0000_0000_0000_00000_010_00000_0001111, 0x0000200f),
+            Err(Exception::IllegalInstruction(0x0000200f))
         );
     }
 

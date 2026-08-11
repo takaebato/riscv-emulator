@@ -354,6 +354,9 @@ impl Cpu {
             }
             // No-op on this in-order single-hart interpreter (see the enum doc).
             Inst::Fence => {}
+            // Fetch always reads DRAM directly (no icache to flush): see the
+            // enum doc. The self-modifying-code test below proves it holds.
+            Inst::FenceI => {}
             // Minimal MRET: just the jump back to mepc. Restoring the privilege
             // level and interrupt-enable state comes with phase 3, along with
             // clearing the low bits of mepc (guaranteed aligned in practice here).
@@ -662,6 +665,21 @@ mod tests {
         cpu.regs[2] = 0;
         assert_eq!(cpu.step(), Err(Exception::LoadAccessFault(0)));
         assert_eq!(cpu.pc, DRAM_BASE);
+    }
+
+    #[test]
+    fn fence_i_orders_self_modifying_code() {
+        // The rv64ui-p-fence_i pattern in miniature: patch the word two slots
+        // ahead, fence.i, then run it. Slot 2 starts as an illegal word and
+        // becomes addi x5, x0, 42 (0x02a00293) — fetch must see the store.
+        // sw x6, 8(x7) = 0x0063a423 / fence.i = 0x0000100f
+        let mut cpu = cpu_with_program(&[0x0063a423, 0x0000100f, 0x00000000]);
+        cpu.regs[6] = 0x02a00293;
+        cpu.regs[7] = DRAM_BASE;
+        cpu.step().unwrap(); // sw: patch slot 2
+        cpu.step().unwrap(); // fence.i: nothing to flush here, by design
+        cpu.step().unwrap(); // the patched addi runs, not the illegal word
+        assert_eq!(cpu.regs[5], 42);
     }
 
     #[test]

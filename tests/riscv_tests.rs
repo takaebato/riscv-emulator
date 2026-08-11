@@ -1,7 +1,8 @@
-//! Run official riscv-tests ELFs through the tohost harness.
+//! Run the official riscv-tests suites through the tohost harness.
 //!
-//! Only tests whose instruction mix is fully implemented are listed; the list
-//! grows as decode fills out, until it can become a directory sweep.
+//! RV64I (plus Zifencei's FENCE.I) is complete, so the whole rv64ui-p
+//! directory is swept and every test in it must pass. Further suites
+//! (rv64um-p-*, ...) join as their extensions are implemented.
 //! Requires the ELFs to be built in vendor/riscv-tests (see docs/setup.md).
 
 use riscv_emulator::{
@@ -24,69 +25,29 @@ fn run_isa_test(name: &str) -> Outcome {
     harness::run(&mut cpu, tohost, STEP_LIMIT)
 }
 
-/// rv64ui-p tests expected to pass with the current instruction set.
-/// Still missing (and excluded here): fence_i (Zifencei).
-const PASSING: &[&str] = &[
-    "rv64ui-p-add",
-    "rv64ui-p-addi",
-    "rv64ui-p-addiw",
-    "rv64ui-p-addw",
-    "rv64ui-p-and",
-    "rv64ui-p-andi",
-    "rv64ui-p-auipc",
-    "rv64ui-p-beq",
-    "rv64ui-p-bge",
-    "rv64ui-p-bgeu",
-    "rv64ui-p-blt",
-    "rv64ui-p-bltu",
-    "rv64ui-p-bne",
-    "rv64ui-p-jal",
-    "rv64ui-p-jalr",
-    "rv64ui-p-lb",
-    "rv64ui-p-lbu",
-    "rv64ui-p-ld",
-    "rv64ui-p-ld_st",
-    "rv64ui-p-lh",
-    "rv64ui-p-lhu",
-    "rv64ui-p-lui",
-    "rv64ui-p-lw",
-    "rv64ui-p-lwu",
-    "rv64ui-p-ma_data",
-    "rv64ui-p-or",
-    "rv64ui-p-ori",
-    "rv64ui-p-sb",
-    "rv64ui-p-sd",
-    "rv64ui-p-sh",
-    "rv64ui-p-simple",
-    "rv64ui-p-sll",
-    "rv64ui-p-slli",
-    "rv64ui-p-slliw",
-    "rv64ui-p-sllw",
-    "rv64ui-p-slt",
-    "rv64ui-p-slti",
-    "rv64ui-p-sltiu",
-    "rv64ui-p-sltu",
-    "rv64ui-p-sra",
-    "rv64ui-p-srai",
-    "rv64ui-p-sraiw",
-    "rv64ui-p-sraw",
-    "rv64ui-p-srl",
-    "rv64ui-p-srli",
-    "rv64ui-p-srliw",
-    "rv64ui-p-srlw",
-    "rv64ui-p-st_ld",
-    "rv64ui-p-sub",
-    "rv64ui-p-subw",
-    "rv64ui-p-sw",
-    "rv64ui-p-xor",
-    "rv64ui-p-xori",
-];
+/// Every ELF in the directory whose name starts with `prefix` (skipping the
+/// .dump disassembly listings), sorted for stable output.
+fn suite(prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir("vendor/riscv-tests/isa")
+        .expect("cannot read vendor/riscv-tests/isa (build riscv-tests first)")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            (name.starts_with(prefix) && !name.ends_with(".dump")).then_some(name)
+        })
+        .collect();
+    names.sort();
+    assert!(!names.is_empty(), "no {prefix}* tests found");
+    names
+}
 
 #[test]
-fn implemented_rv64ui_tests_pass() {
-    let failures: Vec<_> = PASSING
-        .iter()
-        .map(|name| (name, run_isa_test(name)))
+fn the_whole_rv64ui_p_suite_passes() {
+    let failures: Vec<_> = suite("rv64ui-p-")
+        .into_iter()
+        .map(|name| {
+            let outcome = run_isa_test(&name);
+            (name, outcome)
+        })
         .filter(|(_, outcome)| *outcome != Outcome::Pass)
         .collect();
     assert!(failures.is_empty(), "{failures:#?}");
