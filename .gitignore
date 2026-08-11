@@ -2,3 +2,5 @@
 .idea/
 *.log
 .DS_Store
+# Built guest binaries (sources are committed; see guest/*.s for build commands)
+/guest/hello

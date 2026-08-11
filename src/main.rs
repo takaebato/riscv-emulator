@@ -1,8 +1,9 @@
-//! Interpreter loop demo: load an ELF, then fetch → decode → execute with a trace.
-//! Stops on an escaped exception (e.g. an unimplemented instruction), on a
-//! riscv-tests result reported through tohost, or at the step limit.
+//! Emulator entry point. The ELF picks its own environment: a `tohost`
+//! symbol marks a riscv-tests binary (traced run, pass/fail via tohost);
+//! anything else runs under Linux user-mode emulation (untraced, so the
+//! guest owns stdout).
 
-use riscv_emulator::{cpu::Cpu, harness, inst, loader};
+use riscv_emulator::{cpu::Cpu, harness, inst, linux, loader};
 
 /// Safety cap so a legal infinite loop cannot hang the demo.
 const STEP_LIMIT: u64 = 10_000;
@@ -16,15 +17,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cpu = Cpu::new();
     cpu.load_elf(&elf)?;
-    println!("entry: {:#x}", cpu.pc);
 
     // riscv-tests ELFs publish the address of their result variable as the
-    // `tohost` symbol. A generic ELF does not have one; then we just trace.
-    let tohost = elf.symbol("tohost");
-    match tohost {
-        Some(addr) => println!("tohost: {addr:#x}\n"),
-        None => println!("tohost: (no symbol)\n"),
-    }
+    // `tohost` symbol. An ELF without one is a Linux program: hand it to the
+    // syscall environment instead.
+    let Some(tohost) = elf.symbol("tohost") else {
+        let outcome = linux::run(&mut cpu, &mut std::io::stdout(), STEP_LIMIT);
+        println!("{outcome}");
+        return Ok(());
+    };
+    println!("entry: {:#x}", cpu.pc);
+    println!("tohost: {tohost:#x}\n");
 
     let mut executed = 0u64;
     while executed < STEP_LIMIT {
@@ -45,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         executed += 1;
-        if let Some(outcome) = tohost.and_then(|addr| harness::check_tohost(&cpu, addr)) {
+        if let Some(outcome) = harness::check_tohost(&cpu, tohost) {
             println!("\n{outcome}");
             break;
         }
