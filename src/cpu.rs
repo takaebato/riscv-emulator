@@ -102,6 +102,23 @@ impl Cpu {
                 // arithmetic uses the wrapping_* family (avoids debug-build panics).
                 self.regs[rd] = self.regs[rs1].wrapping_add(imm as u64);
             }
+            Inst::Slti { rd, rs1, imm } => {
+                self.regs[rd] = ((self.regs[rs1] as i64) < imm) as u64;
+            }
+            Inst::Sltiu { rd, rs1, imm } => {
+                // The immediate was sign-extended by decode; only the compare
+                // is unsigned. So imm = -1 means "less than 0xffff...ffff".
+                self.regs[rd] = (self.regs[rs1] < imm as u64) as u64;
+            }
+            Inst::Xori { rd, rs1, imm } => {
+                self.regs[rd] = self.regs[rs1] ^ imm as u64;
+            }
+            Inst::Ori { rd, rs1, imm } => {
+                self.regs[rd] = self.regs[rs1] | imm as u64;
+            }
+            Inst::Andi { rd, rs1, imm } => {
+                self.regs[rd] = self.regs[rs1] & imm as u64;
+            }
             Inst::Lui { rd, imm } => {
                 self.regs[rd] = imm as u64;
             }
@@ -502,6 +519,52 @@ mod tests {
         assert_eq!(cpu.regs[1], 1, "signed: -1 < 1");
         cpu.step().unwrap();
         assert_eq!(cpu.regs[1], 0, "unsigned: u64::MAX < 1 is false");
+    }
+
+    #[test]
+    fn slti_vs_sltiu_on_negative_operand() {
+        // x13 = -1: signed says "below zero", unsigned says "the maximum".
+        // slti a4, a3, 0 = 0x0006a713 / sltiu a4, a3, 0 = 0x0006b713
+        let mut cpu = cpu_with_program(&[0x0006a713, 0x0006b713]);
+        cpu.regs[13] = (-1i64) as u64;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 1, "signed: -1 < 0");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 0, "unsigned: u64::MAX < 0 is false");
+    }
+
+    #[test]
+    fn sltiu_with_imm_1_is_seqz() {
+        // sltiu a4, a3, 1 = 0x0016b713: rd = (rs1 == 0), the seqz pseudo
+        // (0 is the only value unsigned-below 1).
+        let mut cpu = cpu_with_program(&[0x0016b713, 0x0016b713]);
+        cpu.regs[13] = 0;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 1, "zero → 1");
+        cpu.regs[13] = 7;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 0, "non-zero → 0");
+    }
+
+    #[test]
+    fn xori_with_all_ones_is_not() {
+        // xori a4, a3, -1 = 0xfff6c713: rd = !rs1, the `not` pseudo. Works
+        // on all 64 bits because the 12-bit immediate sign-extends to all ones.
+        let mut cpu = cpu_with_program(&[0xfff6c713]);
+        cpu.regs[13] = 0x0f0f_1234_abcd_5678;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], !0x0f0f_1234_abcd_5678u64);
+    }
+
+    #[test]
+    fn andi_immediate_sign_extends_across_64_bits() {
+        // andi a4, a3, -241 = 0xf0f6f713 (the rv64ui-p-andi encoding): the
+        // "12-bit" mask really is the 64-bit 0xffff_ffff_ffff_ff0f, so the
+        // upper half of rs1 survives the AND.
+        let mut cpu = cpu_with_program(&[0xf0f6f713]);
+        cpu.regs[13] = 0xdead_beef_0000_00ff;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 0xdead_beef_0000_000f);
     }
 
     #[test]

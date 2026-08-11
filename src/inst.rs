@@ -17,6 +17,20 @@ pub enum Inst {
     /// ADD Immediate: `rd = rs1 + imm`. Also the workhorse behind the `li` (load
     /// immediate, rs1=x0), `mv` (rd = rs1, imm=0) and `nop` pseudo-instructions.
     Addi { rd: usize, rs1: usize, imm: i64 },
+    /// Set Less Than Immediate: `rd = ((rs1 as i64) < imm) ? 1 : 0` (signed).
+    Slti { rd: usize, rs1: usize, imm: i64 },
+    /// Set Less Than Immediate Unsigned. The immediate is still sign-extended
+    /// first; only the comparison is unsigned ("unsigned compare", not
+    /// "unsigned immediate"). `sltiu rd, rs1, 1` is the `seqz` (set if zero)
+    /// pseudo-instruction: only 0 is unsigned-less-than 1.
+    Sltiu { rd: usize, rs1: usize, imm: i64 },
+    /// XOR Immediate. `xori rd, rs1, -1` (all ones) is the `not` pseudo-instruction.
+    Xori { rd: usize, rs1: usize, imm: i64 },
+    /// OR Immediate.
+    Ori { rd: usize, rs1: usize, imm: i64 },
+    /// AND Immediate. With small masks (e.g. `andi rd, rs1, 0xff`) the go-to
+    /// low-bit extractor.
+    Andi { rd: usize, rs1: usize, imm: i64 },
     /// Load Upper Immediate: `rd = imm << 12`. Places the upper 20 bits of a
     /// constant; a following I-type instruction supplies the (signed) low 12,
     /// so the pair covers any sign-extended 32-bit value.
@@ -197,6 +211,11 @@ impl std::fmt::Display for Inst {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Inst::Addi { rd, rs1, imm } => write!(f, "addi x{rd}, x{rs1}, {imm}"),
+            Inst::Slti { rd, rs1, imm } => write!(f, "slti x{rd}, x{rs1}, {imm}"),
+            Inst::Sltiu { rd, rs1, imm } => write!(f, "sltiu x{rd}, x{rs1}, {imm}"),
+            Inst::Xori { rd, rs1, imm } => write!(f, "xori x{rd}, x{rs1}, {imm}"),
+            Inst::Ori { rd, rs1, imm } => write!(f, "ori x{rd}, x{rs1}, {imm}"),
+            Inst::Andi { rd, rs1, imm } => write!(f, "andi x{rd}, x{rs1}, {imm}"),
             // objdump prints the raw upper-20-bit field, not the shifted value
             Inst::Lui { rd, imm } => write!(f, "lui x{rd}, {:#x}", (imm >> 12) & 0xfffff),
             Inst::Auipc { rd, imm } => write!(f, "auipc x{rd}, {:#x}", (imm >> 12) & 0xfffff),
@@ -304,8 +323,15 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
             match (funct3, funct6) {
                 (0x0, _) => Ok(Inst::Addi { rd, rs1, imm: imm_i(raw) }),
                 (0x1, 0b000000) => Ok(Inst::Slli { rd, rs1, shamt }),
+                (0x2, _) => Ok(Inst::Slti { rd, rs1, imm: imm_i(raw) }),
+                (0x3, _) => Ok(Inst::Sltiu { rd, rs1, imm: imm_i(raw) }),
+                (0x4, _) => Ok(Inst::Xori { rd, rs1, imm: imm_i(raw) }),
                 (0x5, 0b000000) => Ok(Inst::Srli { rd, rs1, shamt }),
                 (0x5, 0b010000) => Ok(Inst::Srai { rd, rs1, shamt }),
+                (0x6, _) => Ok(Inst::Ori { rd, rs1, imm: imm_i(raw) }),
+                (0x7, _) => Ok(Inst::Andi { rd, rs1, imm: imm_i(raw) }),
+                // Only reachable for funct3=1/5 with a bad funct6 now: every
+                // funct3 value carries an instruction.
                 _ => Err(Exception::IllegalInstruction(raw)),
             }
         }
@@ -483,6 +509,37 @@ mod tests {
         assert_eq!(
             decode(0xfff08093).unwrap(),
             Inst::Addi { rd: 1, rs1: 1, imm: -1 }
+        );
+    }
+
+    #[test]
+    fn decodes_op_imm_comparisons_and_logic() {
+        // The five OP-IMM funct3 gaps, encodings straight from the rv64ui-p
+        // tests that used to fail on them (a3 = x13, a4 = x14).
+        // 0x0006a713 = slti a4, a3, 0
+        assert_eq!(
+            decode(0x0006a713).unwrap(),
+            Inst::Slti { rd: 14, rs1: 13, imm: 0 }
+        );
+        // 0x0006b713 = sltiu a4, a3, 0
+        assert_eq!(
+            decode(0x0006b713).unwrap(),
+            Inst::Sltiu { rd: 14, rs1: 13, imm: 0 }
+        );
+        // 0xf0f6c713 = xori a4, a3, -241 (0xf0f sign-extends)
+        assert_eq!(
+            decode(0xf0f6c713).unwrap(),
+            Inst::Xori { rd: 14, rs1: 13, imm: -241 }
+        );
+        // 0xf0f6e713 = ori a4, a3, -241
+        assert_eq!(
+            decode(0xf0f6e713).unwrap(),
+            Inst::Ori { rd: 14, rs1: 13, imm: -241 }
+        );
+        // 0xf0f6f713 = andi a4, a3, -241
+        assert_eq!(
+            decode(0xf0f6f713).unwrap(),
+            Inst::Andi { rd: 14, rs1: 13, imm: -241 }
         );
     }
 

@@ -25,14 +25,14 @@ fn run_isa_test(name: &str) -> Outcome {
 }
 
 /// rv64ui-p tests expected to pass with the current instruction set.
-/// Still missing (and excluded here): slti, sltiu, xori, ori, andi, jalr,
-/// and fence_i (Zifencei).
+/// Still missing (and excluded here): jalr and fence_i (Zifencei).
 const PASSING: &[&str] = &[
     "rv64ui-p-add",
     "rv64ui-p-addi",
     "rv64ui-p-addiw",
     "rv64ui-p-addw",
     "rv64ui-p-and",
+    "rv64ui-p-andi",
     "rv64ui-p-auipc",
     "rv64ui-p-beq",
     "rv64ui-p-bge",
@@ -52,6 +52,7 @@ const PASSING: &[&str] = &[
     "rv64ui-p-lwu",
     "rv64ui-p-ma_data",
     "rv64ui-p-or",
+    "rv64ui-p-ori",
     "rv64ui-p-sb",
     "rv64ui-p-sd",
     "rv64ui-p-sh",
@@ -61,6 +62,8 @@ const PASSING: &[&str] = &[
     "rv64ui-p-slliw",
     "rv64ui-p-sllw",
     "rv64ui-p-slt",
+    "rv64ui-p-slti",
+    "rv64ui-p-sltiu",
     "rv64ui-p-sltu",
     "rv64ui-p-sra",
     "rv64ui-p-srai",
@@ -75,6 +78,7 @@ const PASSING: &[&str] = &[
     "rv64ui-p-subw",
     "rv64ui-p-sw",
     "rv64ui-p-xor",
+    "rv64ui-p-xori",
 ];
 
 #[test]
