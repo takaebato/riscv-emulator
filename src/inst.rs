@@ -495,290 +495,335 @@ fn imm_j(raw: u32) -> i64 {
 mod tests {
     use super::*;
 
-    // Expected values below come from real riscv-tests binaries
-    // (cross-checked against the objdump .dump listings).
+    // Encodings below are written in binary with underscores at the field
+    // boundaries, so the decomposition decode performs is visible in the
+    // literal itself. Each is cross-checked against the same word in hex,
+    // as it appears in the objdump .dump listings of real riscv-tests
+    // binaries (or as hand-assembled): getting a field split wrong fails
+    // the equality before decode even runs.
+
+    /// Decode a hand-split binary word after checking it against the objdump
+    /// form: the binary shows the structure, the hex proves the provenance.
+    fn decode_checked(binary: u32, hex: u32) -> Result<Inst, Exception> {
+        assert_eq!(binary, hex, "field split does not match the objdump word");
+        decode(binary)
+    }
 
     #[test]
     fn decodes_addi() {
-        // 0x02028593 = addi a1, t0, 32  (a1 = x11, t0 = x5)
+        // I-type: imm[11:0]_rs1_funct3_rd_opcode
+        // addi a1, t0, 32  (a1 = x11, t0 = x5)
         assert_eq!(
-            decode(0x02028593).unwrap(),
+            decode_checked(0b000000100000_00101_000_01011_0010011, 0x02028593).unwrap(),
             Inst::Addi { rd: 11, rs1: 5, imm: 32 }
         );
-        // 0xfff08093 = addi x1, x1, -1 (negative immediate → sign extension)
+        // addi x1, x1, -1  (negative immediate → sign extension)
         assert_eq!(
-            decode(0xfff08093).unwrap(),
+            decode_checked(0b111111111111_00001_000_00001_0010011, 0xfff08093).unwrap(),
             Inst::Addi { rd: 1, rs1: 1, imm: -1 }
         );
     }
 
     #[test]
     fn decodes_op_imm_comparisons_and_logic() {
-        // The five OP-IMM funct3 gaps, encodings straight from the rv64ui-p
-        // tests that used to fail on them (a3 = x13, a4 = x14).
-        // 0x0006a713 = slti a4, a3, 0
+        // The five OP-IMM funct3 gaps (2/3/4/6/7), encodings straight from
+        // the rv64ui-p tests that used to fail on them (a3 = x13, a4 = x14).
+        // I-type: imm[11:0]_rs1_funct3_rd_opcode
+        // slti a4, a3, 0
         assert_eq!(
-            decode(0x0006a713).unwrap(),
+            decode_checked(0b000000000000_01101_010_01110_0010011, 0x0006a713).unwrap(),
             Inst::Slti { rd: 14, rs1: 13, imm: 0 }
         );
-        // 0x0006b713 = sltiu a4, a3, 0
+        // sltiu a4, a3, 0
         assert_eq!(
-            decode(0x0006b713).unwrap(),
+            decode_checked(0b000000000000_01101_011_01110_0010011, 0x0006b713).unwrap(),
             Inst::Sltiu { rd: 14, rs1: 13, imm: 0 }
         );
-        // 0xf0f6c713 = xori a4, a3, -241 (0xf0f sign-extends)
+        // xori a4, a3, -241  (0xf0f sign-extends)
         assert_eq!(
-            decode(0xf0f6c713).unwrap(),
+            decode_checked(0b111100001111_01101_100_01110_0010011, 0xf0f6c713).unwrap(),
             Inst::Xori { rd: 14, rs1: 13, imm: -241 }
         );
-        // 0xf0f6e713 = ori a4, a3, -241
+        // ori a4, a3, -241
         assert_eq!(
-            decode(0xf0f6e713).unwrap(),
+            decode_checked(0b111100001111_01101_110_01110_0010011, 0xf0f6e713).unwrap(),
             Inst::Ori { rd: 14, rs1: 13, imm: -241 }
         );
-        // 0xf0f6f713 = andi a4, a3, -241
+        // andi a4, a3, -241
         assert_eq!(
-            decode(0xf0f6f713).unwrap(),
+            decode_checked(0b111100001111_01101_111_01110_0010011, 0xf0f6f713).unwrap(),
             Inst::Andi { rd: 14, rs1: 13, imm: -241 }
         );
     }
 
     #[test]
     fn decodes_auipc() {
-        // 0x00000297 = auipc t0, 0x0
-        assert_eq!(decode(0x00000297).unwrap(), Inst::Auipc { rd: 5, imm: 0 });
+        // U-type: imm[31:12]_rd_opcode
+        // auipc t0, 0x0
+        assert_eq!(
+            decode_checked(0b00000000000000000000_00101_0010111, 0x00000297).unwrap(),
+            Inst::Auipc { rd: 5, imm: 0 }
+        );
     }
 
     #[test]
     fn decodes_lui() {
-        // 0xffff8637 = lui a2, 0xffff8 — on RV64 the 32-bit value 0xffff8000
-        // is further sign-extended to 64 bits.
+        // lui a2, 0xffff8 — on RV64 the 32-bit value 0xffff8000 is further
+        // sign-extended to 64 bits.
         assert_eq!(
-            decode(0xffff8637).unwrap(),
+            decode_checked(0b11111111111111111000_01100_0110111, 0xffff8637).unwrap(),
             Inst::Lui { rd: 12, imm: 0xffff_8000u32 as i32 as i64 }
         );
     }
 
     #[test]
     fn decodes_jal() {
-        // 0x0500006f = jal x0, +0x50 (the very first instruction of rv64ui-p-add)
+        // J-type: imm[20]_imm[10:1]_imm[11]_imm[19:12]_rd_opcode
+        // jal x0, +0x50  (the very first instruction of rv64ui-p-add;
+        // 0x50 = 80 → imm[10:1] carries 80/2 = 40 = 0b0000101000)
         assert_eq!(
-            decode(0x0500006f).unwrap(),
+            decode_checked(0b0_0000101000_0_00000000_00000_1101111, 0x0500006f).unwrap(),
             Inst::Jal { rd: 0, offset: 0x50 }
         );
-        // 0xffdff06f = jal x0, -4 (negative offset → J-type sign extension)
+        // jal x0, -4  (negative offset → all-ones upper immediate bits)
         assert_eq!(
-            decode(0xffdff06f).unwrap(),
+            decode_checked(0b1_1111111110_1_11111111_00000_1101111, 0xffdff06f).unwrap(),
             Inst::Jal { rd: 0, offset: -4 }
         );
     }
 
     #[test]
     fn decodes_shifts() {
-        // 0x03529293 = slli t0, t0, 0x35 — shamt 53 > 31 exercises the 6-bit
-        // RV64 shamt field (this encoding is illegal on RV32).
+        // Shift-immediate: funct6_shamt_rs1_funct3_rd_opcode
+        // slli t0, t0, 0x35 — shamt 53 > 31 needs the 6-bit RV64 shamt
+        // field (this same encoding is illegal on RV32).
         assert_eq!(
-            decode(0x03529293).unwrap(),
+            decode_checked(0b000000_110101_00101_001_00101_0010011, 0x03529293).unwrap(),
             Inst::Slli { rd: 5, rs1: 5, shamt: 0x35 }
         );
-        // Hand-assembled: srli x1, x2, 4 / srai x1, x2, 4 (differ in bit 30 only)
+        // Hand-assembled: srli x1, x2, 4 / srai x1, x2, 4 (bit 30 apart)
         assert_eq!(
-            decode(0x00415093).unwrap(),
+            decode_checked(0b000000_000100_00010_101_00001_0010011, 0x00415093).unwrap(),
             Inst::Srli { rd: 1, rs1: 2, shamt: 4 }
         );
         assert_eq!(
-            decode(0x40415093).unwrap(),
+            decode_checked(0b010000_000100_00010_101_00001_0010011, 0x40415093).unwrap(),
             Inst::Srai { rd: 1, rs1: 2, shamt: 4 }
         );
         // SLLI with the SRAI funct6 pattern (bit 30 set) is not a thing
         assert_eq!(
-            decode(0x40411093),
+            decode_checked(0b010000_000100_00010_001_00001_0010011, 0x40411093),
             Err(Exception::IllegalInstruction(0x40411093))
         );
     }
 
     #[test]
     fn decodes_w_family() {
-        // 0x0010029b = addiw t0, zero, 1 — the instruction that stopped the demo
+        // I-type: imm[11:0]_rs1_funct3_rd_opcode
+        // addiw t0, zero, 1 — the instruction that once stopped the demo
         assert_eq!(
-            decode(0x0010029b).unwrap(),
+            decode_checked(0b000000000001_00000_000_00101_0011011, 0x0010029b).unwrap(),
             Inst::Addiw { rd: 5, rs1: 0, imm: 1 }
         );
-        // 0xfff3839b = addiw t2, t2, -1 (sign-extended negative immediate)
+        // addiw t2, t2, -1  (sign-extended negative immediate)
         assert_eq!(
-            decode(0xfff3839b).unwrap(),
+            decode_checked(0b111111111111_00111_000_00111_0011011, 0xfff3839b).unwrap(),
             Inst::Addiw { rd: 7, rs1: 7, imm: -1 }
         );
+        // W shifts: funct7_shamt_rs1_funct3_rd_opcode
         // Hand-assembled: slliw x1, x2, 3 / sraiw x1, x2, 3
         assert_eq!(
-            decode(0x0031109b).unwrap(),
+            decode_checked(0b0000000_00011_00010_001_00001_0011011, 0x0031109b).unwrap(),
             Inst::Slliw { rd: 1, rs1: 2, shamt: 3 }
         );
         assert_eq!(
-            decode(0x4031509b).unwrap(),
+            decode_checked(0b0100000_00011_00010_101_00001_0011011, 0x4031509b).unwrap(),
             Inst::Sraiw { rd: 1, rs1: 2, shamt: 3 }
         );
-        // W shifts have a 5-bit shamt: bit 25 set (shamt 35) must not decode
+        // W shamt is 5 bits: bit 25 (the low funct7 bit) set must not decode
         assert_eq!(
-            decode(0x0231109b),
+            decode_checked(0b0000001_00011_00010_001_00001_0011011, 0x0231109b),
             Err(Exception::IllegalInstruction(0x0231109b))
         );
     }
 
     #[test]
     fn decodes_op() {
-        // 0x00c58733 = add a4, a1, a2 — where the demo stopped
+        // R-type: funct7_rs2_rs1_funct3_rd_opcode
+        // add a4, a1, a2 — where the demo once stopped
         assert_eq!(
-            decode(0x00c58733).unwrap(),
+            decode_checked(0b0000000_01100_01011_000_01110_0110011, 0x00c58733).unwrap(),
             Inst::Add { rd: 14, rs1: 11, rs2: 12 }
         );
         // sub is add with bit 30 set
         assert_eq!(
-            decode(0x40c58733).unwrap(),
+            decode_checked(0b0100000_01100_01011_000_01110_0110011, 0x40c58733).unwrap(),
             Inst::Sub { rd: 14, rs1: 11, rs2: 12 }
         );
         // Hand-assembled: sltu x1, x2, x3 / sra x1, x2, x3
         assert_eq!(
-            decode(0x003130b3).unwrap(),
+            decode_checked(0b0000000_00011_00010_011_00001_0110011, 0x003130b3).unwrap(),
             Inst::Sltu { rd: 1, rs1: 2, rs2: 3 }
         );
         assert_eq!(
-            decode(0x403150b3).unwrap(),
+            decode_checked(0b0100000_00011_00010_101_00001_0110011, 0x403150b3).unwrap(),
             Inst::Sra { rd: 1, rs1: 2, rs2: 3 }
         );
         // funct7 = 0000001 marks the M extension (this word is mul x1, x2, x3);
         // it must stay illegal until phase 2
         assert_eq!(
-            decode(0x023100b3),
+            decode_checked(0b0000001_00011_00010_000_00001_0110011, 0x023100b3),
             Err(Exception::IllegalInstruction(0x023100b3))
         );
     }
 
     #[test]
     fn decodes_op_32() {
+        // R-type: funct7_rs2_rs1_funct3_rd_opcode
         // Hand-assembled: addw/subw a4, a1, a2
         assert_eq!(
-            decode(0x00c5873b).unwrap(),
+            decode_checked(0b0000000_01100_01011_000_01110_0111011, 0x00c5873b).unwrap(),
             Inst::Addw { rd: 14, rs1: 11, rs2: 12 }
         );
         assert_eq!(
-            decode(0x40c5873b).unwrap(),
+            decode_checked(0b0100000_01100_01011_000_01110_0111011, 0x40c5873b).unwrap(),
             Inst::Subw { rd: 14, rs1: 11, rs2: 12 }
         );
         // OP-32 has no logic/compare ops: AND's funct3 slot is a hole here
         assert_eq!(
-            decode(0x00c5f73b),
+            decode_checked(0b0000000_01100_01011_111_01110_0111011, 0x00c5f73b),
             Err(Exception::IllegalInstruction(0x00c5f73b))
         );
     }
 
     #[test]
     fn decodes_branches() {
-        // 0x03ff0863 = beq t5, t6, +0x30 (the tohost check loop in the test env)
+        // B-type: imm[12]_imm[10:5]_rs2_rs1_funct3_imm[4:1]_imm[11]_opcode
+        // beq t5, t6, +0x30  (the tohost check loop; t5/t6 = x30/x31;
+        // 0x30 = 0b0110000 → [10:5] = 000001, [4:1] = 1000)
         assert_eq!(
-            decode(0x03ff0863).unwrap(),
+            decode_checked(0b0_000001_11111_11110_000_1000_0_1100011, 0x03ff0863).unwrap(),
             Inst::Beq { rs1: 30, rs2: 31, offset: 0x30 }
         );
-        // 0x4e771063 = bne a4, t2, +0x4e0 (jump to <fail>)
+        // bne a4, t2, +0x4e0  (jump to <fail>; 0x4e0 → [10:5] = 100111)
         assert_eq!(
-            decode(0x4e771063).unwrap(),
+            decode_checked(0b0_100111_00111_01110_001_0000_0_1100011, 0x4e771063).unwrap(),
             Inst::Bne { rs1: 14, rs2: 7, offset: 0x4e0 }
         );
-        // beq x1, x2, -8 (hand-assembled: backward branch → B-type sign extension)
+        // beq x1, x2, -8  (hand-assembled: backward branch → the sign bit
+        // inst[31] and the upper immediate bits are all ones)
         assert_eq!(
-            decode(0xfe208ce3).unwrap(),
+            decode_checked(0b1_111111_00010_00001_000_1100_1_1100011, 0xfe208ce3).unwrap(),
             Inst::Beq { rs1: 1, rs2: 2, offset: -8 }
         );
         // funct3=2 is a hole in the BRANCH opcode
         assert_eq!(
-            decode(0x00002063),
+            decode_checked(0b0_000000_00000_00000_010_0000_0_1100011, 0x00002063),
             Err(Exception::IllegalInstruction(0x00002063))
         );
     }
 
     #[test]
     fn decodes_loads() {
-        // Hand-assembled: ld x1, 8(x2) / lbu x1, 0(x2) / lw x1, -4(x2)
+        // I-type: imm[11:0]_rs1_funct3_rd_opcode
+        // Hand-assembled: ld x1, 8(x2) / lbu x1, 0(x2) / lw x1, -4(x2).
+        // funct3 = width log2 (011 = 8 bytes), bit 2 = zero-extend (100 = lbu).
         assert_eq!(
-            decode(0x00813083).unwrap(),
+            decode_checked(0b000000001000_00010_011_00001_0000011, 0x00813083).unwrap(),
             Inst::Ld { rd: 1, rs1: 2, offset: 8 }
         );
         assert_eq!(
-            decode(0x00014083).unwrap(),
+            decode_checked(0b000000000000_00010_100_00001_0000011, 0x00014083).unwrap(),
             Inst::Lbu { rd: 1, rs1: 2, offset: 0 }
         );
         assert_eq!(
-            decode(0xffc12083).unwrap(),
+            decode_checked(0b111111111100_00010_010_00001_0000011, 0xffc12083).unwrap(),
             Inst::Lw { rd: 1, rs1: 2, offset: -4 }
         );
         // funct3=7 would be a 128-bit load: illegal on RV64
         assert_eq!(
-            decode(0x00017083),
+            decode_checked(0b000000000000_00010_111_00001_0000011, 0x00017083),
             Err(Exception::IllegalInstruction(0x00017083))
         );
     }
 
     #[test]
     fn decodes_stores() {
-        // 0xfc3f2223 = sw gp, -60(t5) — the riscv-tests tohost result write
-        // (negative offset → S-type sign extension across the split fields)
+        // S-type: imm[11:5]_rs2_rs1_funct3_imm[4:0]_opcode
+        // sw gp, -60(t5) — the riscv-tests tohost result write (gp = x3,
+        // t5 = x30; -60 = 0b111111000100 splits into 1111110 / 00100)
         assert_eq!(
-            decode(0xfc3f2223).unwrap(),
+            decode_checked(0b1111110_00011_11110_010_00100_0100011, 0xfc3f2223).unwrap(),
             Inst::Sw { rs1: 30, rs2: 3, offset: -60 }
         );
-        // Hand-assembled: sd x3, 16(x4)
+        // Hand-assembled: sd x3, 16(x4)  (16 = 0000000_10000: the split is
+        // invisible for small offsets — imm[11:5] is simply zero)
         assert_eq!(
-            decode(0x00323823).unwrap(),
+            decode_checked(0b0000000_00011_00100_011_10000_0100011, 0x00323823).unwrap(),
             Inst::Sd { rs1: 4, rs2: 3, offset: 16 }
         );
     }
 
     #[test]
     fn decodes_csr_instructions() {
-        // 0xf1402573 = csrr a0, mhartid — the instruction that stopped the demo.
-        // csrr is a pseudo-instruction for csrrs with rs1=x0 (read, set nothing).
+        // Zicsr (I-type): csr_rs1_funct3_rd_opcode
+        // csrr a0, mhartid — csrrs with rs1=x0 (read, set nothing);
+        // csr address 0xf14 sits in the immediate field.
         assert_eq!(
-            decode(0xf1402573).unwrap(),
+            decode_checked(0b111100010100_00000_010_01010_1110011, 0xf1402573).unwrap(),
             Inst::Csrrs { rd: 10, rs1: 0, csr: 0xf14 }
         );
-        // 0x30529073 = csrw mtvec, t0 — csrrw with rd=x0 (write, discard old value)
+        // csrw mtvec, t0 — csrrw with rd=x0 (write, discard old value)
         assert_eq!(
-            decode(0x30529073).unwrap(),
+            decode_checked(0b001100000101_00101_001_00000_1110011, 0x30529073).unwrap(),
             Inst::Csrrw { rd: 0, rs1: 5, csr: 0x305 }
         );
     }
 
     #[test]
     fn decodes_ecall_and_ebreak() {
-        assert_eq!(decode(0x00000073).unwrap(), Inst::Ecall);
-        assert_eq!(decode(0x00100073).unwrap(), Inst::Ebreak);
+        // SYSTEM funct3=0: funct12_rs1_funct3_rd_opcode
+        // Everything but funct12 is hardwired zero; ecall/ebreak differ
+        // in the single bit 20.
+        assert_eq!(
+            decode_checked(0b000000000000_00000_000_00000_1110011, 0x00000073).unwrap(),
+            Inst::Ecall
+        );
+        assert_eq!(
+            decode_checked(0b000000000001_00000_000_00000_1110011, 0x00100073).unwrap(),
+            Inst::Ebreak
+        );
     }
 
     #[test]
     fn decodes_mret() {
-        assert_eq!(decode(0x30200073).unwrap(), Inst::Mret);
-        // Same shape, different funct7: SRET (supervisor return) and WFI are
-        // not implemented yet and must stay illegal, not alias to MRET.
+        // mret: funct12 = 0011000_00010 (MRET is funct7=0011000, rs2=00010)
         assert_eq!(
-            decode(0x10200073),
+            decode_checked(0b0011000_00010_00000_000_00000_1110011, 0x30200073).unwrap(),
+            Inst::Mret
+        );
+        // Same shape, different funct7: SRET (0001000) and WFI (rs2=00101)
+        // are not implemented yet and must stay illegal, not alias to MRET.
+        assert_eq!(
+            decode_checked(0b0001000_00010_00000_000_00000_1110011, 0x10200073),
             Err(Exception::IllegalInstruction(0x10200073))
         );
         assert_eq!(
-            decode(0x10500073),
+            decode_checked(0b0001000_00101_00000_000_00000_1110011, 0x10500073),
             Err(Exception::IllegalInstruction(0x10500073))
         );
     }
 
     #[test]
     fn rejects_write_to_read_only_csr() {
-        // csrrw x0, mhartid, x0: mhartid (0xf14) has address bits [11:10] = 11 →
+        // csrrw x0, mhartid, x0: mhartid (0xf14) has address bits [11:10]
+        // = 11 (visible as the leading two bits of the csr field) →
         // read-only, and CSRRW always writes.
         assert_eq!(
-            decode(0xf1401073),
+            decode_checked(0b111100010100_00000_001_00000_1110011, 0xf1401073),
             Err(Exception::IllegalInstruction(0xf1401073))
         );
-        // ...but the pure read above (csrrs with rs1=x0) is fine, and so is
-        // csrrsi with uimm=0.
+        // ...but the pure read (csrrs with rs1=x0, f3=010) is fine.
         assert!(decode(0xf1402573).is_ok());
     }
 
