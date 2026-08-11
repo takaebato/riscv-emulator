@@ -41,6 +41,11 @@ pub enum Inst {
     /// Jump And Link: `rd = pc + 4; pc += offset`. The saved return address makes
     /// it a function call; with rd=x0 the link is discarded and it is a plain jump.
     Jal { rd: usize, offset: i64 },
+    /// Jump And Link Register: `rd = pc + 4; pc = (rs1 + offset) & !1`. The
+    /// computed-target jump: function returns (`ret` = `jalr x0, 0(x1)`),
+    /// indirect calls, and the second half of the auipc+jalr far-call pair.
+    /// Unlike JAL it can produce an odd address, so bit 0 is cleared by spec.
+    Jalr { rd: usize, rs1: usize, offset: i64 },
 
     // --- RV64I OP-IMM shifts ---
     // I-type with the immediate field repurposed: the low 6 bits are the shift
@@ -220,6 +225,7 @@ impl std::fmt::Display for Inst {
             Inst::Lui { rd, imm } => write!(f, "lui x{rd}, {:#x}", (imm >> 12) & 0xfffff),
             Inst::Auipc { rd, imm } => write!(f, "auipc x{rd}, {:#x}", (imm >> 12) & 0xfffff),
             Inst::Jal { rd, offset } => write!(f, "jal x{rd}, {offset}"),
+            Inst::Jalr { rd, rs1, offset } => write!(f, "jalr x{rd}, {offset}(x{rs1})"),
             // objdump prints shift amounts in hex
             Inst::Slli { rd, rs1, shamt } => write!(f, "slli x{rd}, x{rs1}, {shamt:#x}"),
             Inst::Srli { rd, rs1, shamt } => write!(f, "srli x{rd}, x{rs1}, {shamt:#x}"),
@@ -400,6 +406,11 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
         // MISC-MEM: FENCE (funct3=0). FENCE.I (funct3=1, Zifencei) comes later.
         0x0f => match funct3 {
             0x0 => Ok(Inst::Fence),
+            _ => Err(Exception::IllegalInstruction(raw)),
+        },
+        // JALR (I-type): the only instruction on its opcode, so funct3 must be 0
+        0x67 => match funct3 {
+            0x0 => Ok(Inst::Jalr { rd, rs1, offset: imm_i(raw) }),
             _ => Err(Exception::IllegalInstruction(raw)),
         },
         // JAL (J-type)
@@ -589,6 +600,26 @@ mod tests {
         assert_eq!(
             decode_checked(0b1_1111111110_1_11111111_00000_1101111, 0xffdff06f).unwrap(),
             Inst::Jal { rd: 0, offset: -4 }
+        );
+    }
+
+    #[test]
+    fn decodes_jalr() {
+        // I-type: imm[11:0]_rs1_funct3_rd_opcode
+        // jalr t0, 0(t1) — where rv64ui-p-jalr used to stop (t0=x5, t1=x6)
+        assert_eq!(
+            decode_checked(0b000000000000_00110_000_00101_1100111, 0x000302e7).unwrap(),
+            Inst::Jalr { rd: 5, rs1: 6, offset: 0 }
+        );
+        // jalr x0, 0(x1) — the `ret` pseudo-instruction
+        assert_eq!(
+            decode_checked(0b000000000000_00001_000_00000_1100111, 0x00008067).unwrap(),
+            Inst::Jalr { rd: 0, rs1: 1, offset: 0 }
+        );
+        // JALR owns its whole opcode: funct3 != 0 does not decode
+        assert_eq!(
+            decode_checked(0b000000000000_00001_001_00000_1100111, 0x00009067),
+            Err(Exception::IllegalInstruction(0x00009067))
         );
     }
 

@@ -209,6 +209,15 @@ impl Cpu {
                 self.regs[rd] = self.pc.wrapping_add(4); // link: return address
                 next_pc = self.pc.wrapping_add(offset as u64);
             }
+            Inst::Jalr { rd, rs1, offset } => {
+                // Read rs1 before writing rd: rd may be the same register
+                // (rv64ui-p-jalr exercises jalr t0, t0). The spec requires
+                // clearing bit 0 of the computed target (JAL cannot even
+                // encode an odd offset, but a register sum can be odd).
+                let target = self.regs[rs1].wrapping_add(offset as u64) & !1;
+                self.regs[rd] = self.pc.wrapping_add(4); // link: return address
+                next_pc = target;
+            }
             // Branches: on a taken branch the offset replaces the straight-line
             // next_pc. Signed conditions compare the same 64 bits reinterpreted
             // as i64 — the register file itself has no notion of signedness.
@@ -424,6 +433,38 @@ mod tests {
         cpu.step().unwrap();
         assert_eq!(cpu.regs[1], DRAM_BASE + 4, "link register holds pc+4");
         assert_eq!(cpu.pc, DRAM_BASE + 8, "pc jumped by the offset");
+    }
+
+    #[test]
+    fn jalr_jumps_to_rs1_and_links() {
+        // jalr t0, 0(t1) = 0x000302e7 — an absolute jump: the target comes
+        // from a register, not from pc like jal/branches.
+        let mut cpu = cpu_with_program(&[0x000302e7]);
+        cpu.regs[6] = DRAM_BASE + 0x100;
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, DRAM_BASE + 0x100, "jumped to rs1 + offset");
+        assert_eq!(cpu.regs[5], DRAM_BASE + 4, "link register holds pc+4");
+    }
+
+    #[test]
+    fn jalr_with_rd_equal_rs1_reads_before_writing() {
+        // jalr t0, 0(t0) = 0x000282e7 (the rv64ui-p-jalr trap): the target
+        // must come from the old t0, not from the freshly written link.
+        let mut cpu = cpu_with_program(&[0x000282e7]);
+        cpu.regs[5] = DRAM_BASE + 0x80;
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, DRAM_BASE + 0x80, "target read before the link write");
+        assert_eq!(cpu.regs[5], DRAM_BASE + 4);
+    }
+
+    #[test]
+    fn jalr_clears_bit_0_of_the_target() {
+        // ret = jalr x0, 0(x1) = 0x00008067, here with an odd address in ra.
+        let mut cpu = cpu_with_program(&[0x00008067]);
+        cpu.regs[1] = DRAM_BASE + 0x101;
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, DRAM_BASE + 0x100, "bit 0 masked off by spec");
+        assert_eq!(cpu.regs[0], 0, "ret discards the link into x0");
     }
 
     #[test]
