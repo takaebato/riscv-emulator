@@ -205,6 +205,29 @@ impl Cpu {
                 let shamt = self.regs[rs2] & 0x1f;
                 self.regs[rd] = ((self.regs[rs1] as i32) >> shamt) as u64;
             }
+            // M multiplies: the full 64x64 product is 128 bits, so compute in
+            // i128/u128 and pick a half. The casts encode the operand
+            // signedness: `as i64 as i128` sign-extends, `as u128`/`as i128`
+            // on a u64 zero-extends.
+            Inst::Mul { rd, rs1, rs2 } => {
+                self.regs[rd] = self.regs[rs1].wrapping_mul(self.regs[rs2]);
+            }
+            Inst::Mulh { rd, rs1, rs2 } => {
+                let product = (self.regs[rs1] as i64 as i128) * (self.regs[rs2] as i64 as i128);
+                self.regs[rd] = (product >> 64) as u64;
+            }
+            Inst::Mulhsu { rd, rs1, rs2 } => {
+                let product = (self.regs[rs1] as i64 as i128) * (self.regs[rs2] as i128);
+                self.regs[rd] = (product >> 64) as u64;
+            }
+            Inst::Mulhu { rd, rs1, rs2 } => {
+                let product = (self.regs[rs1] as u128) * (self.regs[rs2] as u128);
+                self.regs[rd] = (product >> 64) as u64;
+            }
+            Inst::Mulw { rd, rs1, rs2 } => {
+                let result = (self.regs[rs1] as u32).wrapping_mul(self.regs[rs2] as u32);
+                self.regs[rd] = result as i32 as u64;
+            }
             Inst::Jal { rd, offset } => {
                 self.regs[rd] = self.pc.wrapping_add(4); // link: return address
                 next_pc = self.pc.wrapping_add(offset as u64);
@@ -427,6 +450,49 @@ mod tests {
         let mut cpu = cpu_with_program(&[0x00001297]);
         cpu.step().unwrap();
         assert_eq!(cpu.regs[5], DRAM_BASE + 0x1000);
+    }
+
+    #[test]
+    fn mul_and_mulh_split_the_128_bit_product() {
+        // (-1) * (-1) = 1: mul gives the low half (1), mulh the high (0).
+        // mul a4, a1, a2 = 0x02c58733 / mulh a4, a1, a2 = 0x02c59733
+        let mut cpu = cpu_with_program(&[0x02c58733, 0x02c59733]);
+        cpu.regs[11] = (-1i64) as u64;
+        cpu.regs[12] = (-1i64) as u64;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 1, "low half");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 0, "high half of +1 is 0");
+    }
+
+    #[test]
+    fn mulh_variants_disagree_on_the_same_bits() {
+        // Same operands (all-ones, all-ones), three readings:
+        //   signed x signed:     (-1) * (-1)      -> high 64 = 0
+        //   unsigned x unsigned: (2^64-1)^2       -> high 64 = 2^64 - 2
+        //   signed x unsigned:   (-1) * (2^64-1)  -> high 64 = 2^64 - 1
+        // mulh = 0x02c59733 / mulhu = 0x02c5b733 / mulhsu = 0x02c5a733
+        let mut cpu = cpu_with_program(&[0x02c59733, 0x02c5b733, 0x02c5a733]);
+        cpu.regs[11] = u64::MAX;
+        cpu.regs[12] = u64::MAX;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 0, "mulh: signed");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], u64::MAX - 1, "mulhu: unsigned");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], u64::MAX, "mulhsu: mixed");
+    }
+
+    #[test]
+    fn mulw_wraps_at_32_bits_and_sign_extends() {
+        // 0x7fffffff * 2 = 0xfffffffe: the product carries into bit 31, so
+        // the 32-bit result is negative and sign-extends.
+        // mulw a4, a1, a2 = 0x02c5873b
+        let mut cpu = cpu_with_program(&[0x02c5873b]);
+        cpu.regs[11] = 0x7fff_ffff;
+        cpu.regs[12] = 2;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 0xffff_ffff_ffff_fffe);
     }
 
     #[test]

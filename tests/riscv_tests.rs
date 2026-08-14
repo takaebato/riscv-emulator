@@ -41,6 +41,20 @@ fn suite(prefix: &str) -> Vec<String> {
 }
 
 #[test]
+fn the_rv64um_p_multiply_family_passes() {
+    // Widens to suite("rv64um-p-") once the divide half of M lands.
+    let failures: Vec<_> = suite("rv64um-p-mul")
+        .into_iter()
+        .map(|name| {
+            let outcome = run_isa_test(&name);
+            (name, outcome)
+        })
+        .filter(|(_, outcome)| *outcome != Outcome::Pass)
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
 fn the_whole_rv64ui_p_suite_passes() {
     let failures: Vec<_> = suite("rv64ui-p-")
         .into_iter()

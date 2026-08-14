@@ -114,6 +114,26 @@ pub enum Inst {
     /// 32-bit arithmetic shift right (bit 31 is the sign).
     Sraw { rd: usize, rs1: usize, rs2: usize },
 
+    // --- M extension: multiplication (funct7=0000001 on OP / OP-32) ---
+    // A 64×64 product is 128 bits; one instruction returns one half.
+    //
+    /// MULtiply: `rd = low 64 bits of rs1 * rs2`. The low half is identical
+    /// whether the operands are read as signed or unsigned (two's-complement
+    /// property), so one instruction covers both.
+    Mul { rd: usize, rs1: usize, rs2: usize },
+    /// MULtiply High: high 64 bits of the signed × signed product.
+    Mulh { rd: usize, rs1: usize, rs2: usize },
+    /// MULtiply High Signed×Unsigned: rs1 signed, rs2 unsigned. The fourth
+    /// combination (unsigned × signed) needs no opcode: swap the operands.
+    /// Exists to build multi-word signed multiplication.
+    Mulhsu { rd: usize, rs1: usize, rs2: usize },
+    /// MULtiply High Unsigned: high 64 bits of the unsigned × unsigned product.
+    Mulhu { rd: usize, rs1: usize, rs2: usize },
+    /// MULtiply Word (OP-32): low 32 × low 32, low 32 bits of the result
+    /// sign-extended to 64. No MULHW: fetch the high half of a 32-bit
+    /// product with a plain MUL on sign-extended operands and a shift.
+    Mulw { rd: usize, rs1: usize, rs2: usize },
+
     // --- RV64I branches (B-type) ---
     // Compare rs1 with rs2 and, if the condition holds, jump pc-relative.
     // No condition-code register in RISC-V: every branch does its own compare.
@@ -255,6 +275,11 @@ impl std::fmt::Display for Inst {
             Inst::Sllw { rd, rs1, rs2 } => write!(f, "sllw x{rd}, x{rs1}, x{rs2}"),
             Inst::Srlw { rd, rs1, rs2 } => write!(f, "srlw x{rd}, x{rs1}, x{rs2}"),
             Inst::Sraw { rd, rs1, rs2 } => write!(f, "sraw x{rd}, x{rs1}, x{rs2}"),
+            Inst::Mul { rd, rs1, rs2 } => write!(f, "mul x{rd}, x{rs1}, x{rs2}"),
+            Inst::Mulh { rd, rs1, rs2 } => write!(f, "mulh x{rd}, x{rs1}, x{rs2}"),
+            Inst::Mulhsu { rd, rs1, rs2 } => write!(f, "mulhsu x{rd}, x{rs1}, x{rs2}"),
+            Inst::Mulhu { rd, rs1, rs2 } => write!(f, "mulhu x{rd}, x{rs1}, x{rs2}"),
+            Inst::Mulw { rd, rs1, rs2 } => write!(f, "mulw x{rd}, x{rs1}, x{rs2}"),
             Inst::Beq { rs1, rs2, offset } => write!(f, "beq x{rs1}, x{rs2}, {offset}"),
             Inst::Bne { rs1, rs2, offset } => write!(f, "bne x{rs1}, x{rs2}, {offset}"),
             Inst::Blt { rs1, rs2, offset } => write!(f, "blt x{rs1}, x{rs2}, {offset}"),
@@ -380,7 +405,12 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
                 (0x5, 0b0100000) => Ok(Inst::Sra { rd, rs1, rs2 }),
                 (0x6, 0b0000000) => Ok(Inst::Or { rd, rs1, rs2 }),
                 (0x7, 0b0000000) => Ok(Inst::And { rd, rs1, rs2 }),
-                // funct7 = 0000001 is the M extension (MUL/DIV), phase 2
+                // funct7 = 0000001: the M extension. funct3 bit 2 splits it
+                // into multiplies (0-3, here) and divides (4-7, next step).
+                (0x0, 0b0000001) => Ok(Inst::Mul { rd, rs1, rs2 }),
+                (0x1, 0b0000001) => Ok(Inst::Mulh { rd, rs1, rs2 }),
+                (0x2, 0b0000001) => Ok(Inst::Mulhsu { rd, rs1, rs2 }),
+                (0x3, 0b0000001) => Ok(Inst::Mulhu { rd, rs1, rs2 }),
                 _ => Err(Exception::IllegalInstruction(raw)),
             }
         }
@@ -393,6 +423,8 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
                 (0x1, 0b0000000) => Ok(Inst::Sllw { rd, rs1, rs2 }),
                 (0x5, 0b0000000) => Ok(Inst::Srlw { rd, rs1, rs2 }),
                 (0x5, 0b0100000) => Ok(Inst::Sraw { rd, rs1, rs2 }),
+                // M extension, word width. Only MULW here (no MULHW).
+                (0x0, 0b0000001) => Ok(Inst::Mulw { rd, rs1, rs2 }),
                 _ => Err(Exception::IllegalInstruction(raw)),
             }
         }
@@ -710,11 +742,11 @@ mod tests {
             decode_checked(0b0100000_00011_00010_101_00001_0110011, 0x403150b3).unwrap(),
             Inst::Sra { rd: 1, rs1: 2, rs2: 3 }
         );
-        // funct7 = 0000001 marks the M extension (this word is mul x1, x2, x3);
-        // it must stay illegal until phase 2
+        // The divide half of the M extension (funct3 bit 2 set) is still
+        // ahead of us: this word is div x1, x2, x3.
         assert_eq!(
-            decode_checked(0b0000001_00011_00010_000_00001_0110011, 0x023100b3),
-            Err(Exception::IllegalInstruction(0x023100b3))
+            decode_checked(0b0000001_00011_00010_100_00001_0110011, 0x023140b3),
+            Err(Exception::IllegalInstruction(0x023140b3))
         );
     }
 
@@ -734,6 +766,43 @@ mod tests {
         assert_eq!(
             decode_checked(0b0000000_01100_01011_111_01110_0111011, 0x00c5f73b),
             Err(Exception::IllegalInstruction(0x00c5f73b))
+        );
+    }
+
+    #[test]
+    fn decodes_m_multiplies() {
+        // R-type: funct7_rs2_rs1_funct3_rd_opcode
+        // The multiply half of the M extension: funct7=0000001, funct3=0-3.
+        // Encodings from the rv64um-p dumps (a4, a1, a2 = x14, x11, x12).
+        // mul a4, a1, a2 — where rv64um-p-mul used to stop
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_000_01110_0110011, 0x02c58733).unwrap(),
+            Inst::Mul { rd: 14, rs1: 11, rs2: 12 }
+        );
+        // mulh a4, a1, a2
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_001_01110_0110011, 0x02c59733).unwrap(),
+            Inst::Mulh { rd: 14, rs1: 11, rs2: 12 }
+        );
+        // mulhsu a4, a1, a2
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_010_01110_0110011, 0x02c5a733).unwrap(),
+            Inst::Mulhsu { rd: 14, rs1: 11, rs2: 12 }
+        );
+        // mulhu a4, a1, a2
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_011_01110_0110011, 0x02c5b733).unwrap(),
+            Inst::Mulhu { rd: 14, rs1: 11, rs2: 12 }
+        );
+        // mulw a4, a1, a2 (OP-32)
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_000_01110_0111011, 0x02c5873b).unwrap(),
+            Inst::Mulw { rd: 14, rs1: 11, rs2: 12 }
+        );
+        // OP-32 has no MULHW: funct3=1 with the M funct7 stays illegal
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_001_01110_0111011, 0x02c5973b),
+            Err(Exception::IllegalInstruction(0x02c5973b))
         );
     }
 
