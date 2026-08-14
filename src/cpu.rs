@@ -228,6 +228,56 @@ impl Cpu {
                 let result = (self.regs[rs1] as u32).wrapping_mul(self.regs[rs2] as u32);
                 self.regs[rd] = result as i32 as u64;
             }
+            // M divides: no traps, the error cases have defined values.
+            // Division by zero: quotient all ones, remainder = the dividend.
+            // Signed overflow (MIN / -1, the one two's-complement quotient
+            // that does not fit): quotient MIN, remainder 0 — which is what
+            // Rust's wrapping_div/wrapping_rem compute, so only the zero
+            // divisor needs an explicit branch (a bare `/` would panic on
+            // both cases).
+            Inst::Div { rd, rs1, rs2 } => {
+                let (a, b) = (self.regs[rs1] as i64, self.regs[rs2] as i64);
+                self.regs[rd] = if b == 0 { u64::MAX } else { a.wrapping_div(b) as u64 };
+            }
+            Inst::Divu { rd, rs1, rs2 } => {
+                let (a, b) = (self.regs[rs1], self.regs[rs2]);
+                self.regs[rd] = if b == 0 { u64::MAX } else { a / b };
+            }
+            Inst::Rem { rd, rs1, rs2 } => {
+                let (a, b) = (self.regs[rs1] as i64, self.regs[rs2] as i64);
+                self.regs[rd] = if b == 0 { a as u64 } else { a.wrapping_rem(b) as u64 };
+            }
+            Inst::Remu { rd, rs1, rs2 } => {
+                let (a, b) = (self.regs[rs1], self.regs[rs2]);
+                self.regs[rd] = if b == 0 { a } else { a % b };
+            }
+            // The W variants divide the low 32 bits and, like every W
+            // instruction, sign-extend the 32-bit result — including the
+            // unsigned ones: a quotient with bit 31 set comes back negative.
+            Inst::Divw { rd, rs1, rs2 } => {
+                let (a, b) = (self.regs[rs1] as i32, self.regs[rs2] as i32);
+                self.regs[rd] = if b == 0 { u64::MAX } else { a.wrapping_div(b) as i64 as u64 };
+            }
+            Inst::Divuw { rd, rs1, rs2 } => {
+                let (a, b) = (self.regs[rs1] as u32, self.regs[rs2] as u32);
+                self.regs[rd] = if b == 0 { u64::MAX } else { (a / b) as i32 as u64 };
+            }
+            Inst::Remw { rd, rs1, rs2 } => {
+                let (a, b) = (self.regs[rs1] as i32, self.regs[rs2] as i32);
+                self.regs[rd] = if b == 0 {
+                    a as i64 as u64
+                } else {
+                    a.wrapping_rem(b) as i64 as u64
+                };
+            }
+            Inst::Remuw { rd, rs1, rs2 } => {
+                let (a, b) = (self.regs[rs1] as u32, self.regs[rs2] as u32);
+                self.regs[rd] = if b == 0 {
+                    a as i32 as u64
+                } else {
+                    (a % b) as i32 as u64
+                };
+            }
             Inst::Jal { rd, offset } => {
                 self.regs[rd] = self.pc.wrapping_add(4); // link: return address
                 next_pc = self.pc.wrapping_add(offset as u64);
@@ -493,6 +543,63 @@ mod tests {
         cpu.regs[12] = 2;
         cpu.step().unwrap();
         assert_eq!(cpu.regs[14], 0xffff_ffff_ffff_fffe);
+    }
+
+    #[test]
+    fn division_by_zero_has_defined_results_and_no_trap() {
+        // div, divu, rem, remu a4, a1, a2 with a2 = 0: the quotients read
+        // all ones, the remainders return the dividend. Four instructions,
+        // zero traps.
+        let mut cpu =
+            cpu_with_program(&[0x02c5c733, 0x02c5d733, 0x02c5e733, 0x02c5f733]);
+        cpu.regs[11] = 42;
+        cpu.regs[12] = 0;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], u64::MAX, "div by zero: all ones");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], u64::MAX, "divu by zero: all ones");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 42, "rem by zero: the dividend");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 42, "remu by zero: the dividend");
+    }
+
+    #[test]
+    fn signed_overflow_min_divided_by_minus_one() {
+        // The one quotient two's complement cannot represent: -MIN = 2^63.
+        // The spec defines div -> MIN and rem -> 0 instead of trapping.
+        let mut cpu = cpu_with_program(&[0x02c5c733, 0x02c5e733]);
+        cpu.regs[11] = i64::MIN as u64;
+        cpu.regs[12] = (-1i64) as u64;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], i64::MIN as u64, "quotient wraps to MIN");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 0, "remainder is 0");
+    }
+
+    #[test]
+    fn rem_sign_follows_the_dividend() {
+        // -7 / 2: rounding toward zero gives -3 remainder -1 (not +1),
+        // so div * divisor + rem == dividend holds.
+        let mut cpu = cpu_with_program(&[0x02c5c733, 0x02c5e733]);
+        cpu.regs[11] = (-7i64) as u64;
+        cpu.regs[12] = 2;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], (-3i64) as u64);
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], (-1i64) as u64);
+    }
+
+    #[test]
+    fn divuw_sign_extends_its_unsigned_result() {
+        // 0x80000000 / 1: an unsigned 32-bit quotient whose bit 31 is set
+        // still sign-extends, like every W instruction (the invariant that
+        // upper halves always mirror bit 31 beats "unsigned" here).
+        let mut cpu = cpu_with_program(&[0x02c5d73b]);
+        cpu.regs[11] = 0x8000_0000;
+        cpu.regs[12] = 1;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 0xffff_ffff_8000_0000);
     }
 
     #[test]

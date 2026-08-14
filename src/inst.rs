@@ -134,6 +134,30 @@ pub enum Inst {
     /// product with a plain MUL on sign-extended operands and a shift.
     Mulw { rd: usize, rs1: usize, rs2: usize },
 
+    // --- M extension: division (funct7=0000001, funct3 4-7) ---
+    // No arithmetic traps in RISC-V: the two error cases have defined
+    // result values instead. Division by zero returns all ones (DIV*) or
+    // the dividend (REM*); signed overflow (MIN / -1) returns MIN / 0.
+    //
+    /// DIVide (signed): `rd = rs1 / rs2`, rounding toward zero.
+    Div { rd: usize, rs1: usize, rs2: usize },
+    /// DIVide Unsigned.
+    Divu { rd: usize, rs1: usize, rs2: usize },
+    /// REMainder (signed): the sign follows the dividend (rs1), pairing
+    /// with DIV so that `div*rs2 + rem == rs1` always holds.
+    Rem { rd: usize, rs1: usize, rs2: usize },
+    /// REMainder Unsigned.
+    Remu { rd: usize, rs1: usize, rs2: usize },
+    /// DIVide Word: low 32 / low 32 as signed, result sign-extended.
+    Divw { rd: usize, rs1: usize, rs2: usize },
+    /// DIVide Unsigned Word. The 32-bit result is still sign-extended:
+    /// a quotient with bit 31 set comes back with all upper bits ones.
+    Divuw { rd: usize, rs1: usize, rs2: usize },
+    /// REMainder Word (signed).
+    Remw { rd: usize, rs1: usize, rs2: usize },
+    /// REMainder Unsigned Word (sign-extended like DIVUW).
+    Remuw { rd: usize, rs1: usize, rs2: usize },
+
     // --- RV64I branches (B-type) ---
     // Compare rs1 with rs2 and, if the condition holds, jump pc-relative.
     // No condition-code register in RISC-V: every branch does its own compare.
@@ -280,6 +304,14 @@ impl std::fmt::Display for Inst {
             Inst::Mulhsu { rd, rs1, rs2 } => write!(f, "mulhsu x{rd}, x{rs1}, x{rs2}"),
             Inst::Mulhu { rd, rs1, rs2 } => write!(f, "mulhu x{rd}, x{rs1}, x{rs2}"),
             Inst::Mulw { rd, rs1, rs2 } => write!(f, "mulw x{rd}, x{rs1}, x{rs2}"),
+            Inst::Div { rd, rs1, rs2 } => write!(f, "div x{rd}, x{rs1}, x{rs2}"),
+            Inst::Divu { rd, rs1, rs2 } => write!(f, "divu x{rd}, x{rs1}, x{rs2}"),
+            Inst::Rem { rd, rs1, rs2 } => write!(f, "rem x{rd}, x{rs1}, x{rs2}"),
+            Inst::Remu { rd, rs1, rs2 } => write!(f, "remu x{rd}, x{rs1}, x{rs2}"),
+            Inst::Divw { rd, rs1, rs2 } => write!(f, "divw x{rd}, x{rs1}, x{rs2}"),
+            Inst::Divuw { rd, rs1, rs2 } => write!(f, "divuw x{rd}, x{rs1}, x{rs2}"),
+            Inst::Remw { rd, rs1, rs2 } => write!(f, "remw x{rd}, x{rs1}, x{rs2}"),
+            Inst::Remuw { rd, rs1, rs2 } => write!(f, "remuw x{rd}, x{rs1}, x{rs2}"),
             Inst::Beq { rs1, rs2, offset } => write!(f, "beq x{rs1}, x{rs2}, {offset}"),
             Inst::Bne { rs1, rs2, offset } => write!(f, "bne x{rs1}, x{rs2}, {offset}"),
             Inst::Blt { rs1, rs2, offset } => write!(f, "blt x{rs1}, x{rs2}, {offset}"),
@@ -406,11 +438,15 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
                 (0x6, 0b0000000) => Ok(Inst::Or { rd, rs1, rs2 }),
                 (0x7, 0b0000000) => Ok(Inst::And { rd, rs1, rs2 }),
                 // funct7 = 0000001: the M extension. funct3 bit 2 splits it
-                // into multiplies (0-3, here) and divides (4-7, next step).
+                // into multiplies (0-3) and divides (4-7).
                 (0x0, 0b0000001) => Ok(Inst::Mul { rd, rs1, rs2 }),
                 (0x1, 0b0000001) => Ok(Inst::Mulh { rd, rs1, rs2 }),
                 (0x2, 0b0000001) => Ok(Inst::Mulhsu { rd, rs1, rs2 }),
                 (0x3, 0b0000001) => Ok(Inst::Mulhu { rd, rs1, rs2 }),
+                (0x4, 0b0000001) => Ok(Inst::Div { rd, rs1, rs2 }),
+                (0x5, 0b0000001) => Ok(Inst::Divu { rd, rs1, rs2 }),
+                (0x6, 0b0000001) => Ok(Inst::Rem { rd, rs1, rs2 }),
+                (0x7, 0b0000001) => Ok(Inst::Remu { rd, rs1, rs2 }),
                 _ => Err(Exception::IllegalInstruction(raw)),
             }
         }
@@ -425,6 +461,10 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
                 (0x5, 0b0100000) => Ok(Inst::Sraw { rd, rs1, rs2 }),
                 // M extension, word width. Only MULW here (no MULHW).
                 (0x0, 0b0000001) => Ok(Inst::Mulw { rd, rs1, rs2 }),
+                (0x4, 0b0000001) => Ok(Inst::Divw { rd, rs1, rs2 }),
+                (0x5, 0b0000001) => Ok(Inst::Divuw { rd, rs1, rs2 }),
+                (0x6, 0b0000001) => Ok(Inst::Remw { rd, rs1, rs2 }),
+                (0x7, 0b0000001) => Ok(Inst::Remuw { rd, rs1, rs2 }),
                 _ => Err(Exception::IllegalInstruction(raw)),
             }
         }
@@ -742,11 +782,11 @@ mod tests {
             decode_checked(0b0100000_00011_00010_101_00001_0110011, 0x403150b3).unwrap(),
             Inst::Sra { rd: 1, rs1: 2, rs2: 3 }
         );
-        // The divide half of the M extension (funct3 bit 2 set) is still
-        // ahead of us: this word is div x1, x2, x3.
+        // An unassigned funct7 (0000011) must not decode: only 0000000,
+        // 0100000 and the M extension's 0000001 mean anything on OP.
         assert_eq!(
-            decode_checked(0b0000001_00011_00010_100_00001_0110011, 0x023140b3),
-            Err(Exception::IllegalInstruction(0x023140b3))
+            decode_checked(0b0000011_00011_00010_000_00001_0110011, 0x063100b3),
+            Err(Exception::IllegalInstruction(0x063100b3))
         );
     }
 
@@ -803,6 +843,46 @@ mod tests {
         assert_eq!(
             decode_checked(0b0000001_01100_01011_001_01110_0111011, 0x02c5973b),
             Err(Exception::IllegalInstruction(0x02c5973b))
+        );
+    }
+
+    #[test]
+    fn decodes_m_divides() {
+        // R-type: funct7_rs2_rs1_funct3_rd_opcode
+        // The divide half of M: funct3 4-7 = div/divu/rem/remu, and the
+        // same four on OP-32 as the W variants. Encodings from the
+        // rv64um-p dumps (a4, a1, a2 = x14, x11, x12).
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_100_01110_0110011, 0x02c5c733).unwrap(),
+            Inst::Div { rd: 14, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_101_01110_0110011, 0x02c5d733).unwrap(),
+            Inst::Divu { rd: 14, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_110_01110_0110011, 0x02c5e733).unwrap(),
+            Inst::Rem { rd: 14, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_111_01110_0110011, 0x02c5f733).unwrap(),
+            Inst::Remu { rd: 14, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_100_01110_0111011, 0x02c5c73b).unwrap(),
+            Inst::Divw { rd: 14, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_101_01110_0111011, 0x02c5d73b).unwrap(),
+            Inst::Divuw { rd: 14, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_110_01110_0111011, 0x02c5e73b).unwrap(),
+            Inst::Remw { rd: 14, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode_checked(0b0000001_01100_01011_111_01110_0111011, 0x02c5f73b).unwrap(),
+            Inst::Remuw { rd: 14, rs1: 11, rs2: 12 }
         );
     }
 
