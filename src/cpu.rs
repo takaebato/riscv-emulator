@@ -88,6 +88,38 @@ impl Cpu {
         self.pc = self.csrs[MTVEC] & !0b11;
     }
 
+    /// One 32-bit atomic read-modify-write: rd = sign-extended old value,
+    /// memory = op(old, rs2 low 32). A faulting address propagates before
+    /// rd is written or pc commits, like any load/store.
+    fn amo_w(
+        &mut self,
+        rd: usize,
+        rs1: usize,
+        rs2: usize,
+        op: impl Fn(u32, u32) -> u32,
+    ) -> Result<(), Exception> {
+        let addr = self.regs[rs1];
+        let old = self.bus.load32(addr)?;
+        self.bus.store32(addr, op(old, self.regs[rs2] as u32))?;
+        self.regs[rd] = old as i32 as u64;
+        Ok(())
+    }
+
+    /// The 64-bit sibling of [`Self::amo_w`].
+    fn amo_d(
+        &mut self,
+        rd: usize,
+        rs1: usize,
+        rs2: usize,
+        op: impl Fn(u64, u64) -> u64,
+    ) -> Result<(), Exception> {
+        let addr = self.regs[rs1];
+        let old = self.bus.load64(addr)?;
+        self.bus.store64(addr, op(old, self.regs[rs2]))?;
+        self.regs[rd] = old;
+        Ok(())
+    }
+
     /// Execute one decoded instruction: update registers and advance pc.
     ///
     /// During execution `self.pc` still points at the current instruction (jumps and
@@ -277,6 +309,62 @@ impl Cpu {
                 } else {
                     (a % b) as i32 as u64
                 };
+            }
+            // AMOs: each is the shared read-modify-write with its own
+            // combining function; the signed min/max go through i32/i64.
+            Inst::AmoaddW { rd, rs1, rs2 } => {
+                self.amo_w(rd, rs1, rs2, |a, b| a.wrapping_add(b))?;
+            }
+            Inst::AmoaddD { rd, rs1, rs2 } => {
+                self.amo_d(rd, rs1, rs2, |a, b| a.wrapping_add(b))?;
+            }
+            Inst::AmoswapW { rd, rs1, rs2 } => {
+                self.amo_w(rd, rs1, rs2, |_, b| b)?;
+            }
+            Inst::AmoswapD { rd, rs1, rs2 } => {
+                self.amo_d(rd, rs1, rs2, |_, b| b)?;
+            }
+            Inst::AmoxorW { rd, rs1, rs2 } => {
+                self.amo_w(rd, rs1, rs2, |a, b| a ^ b)?;
+            }
+            Inst::AmoxorD { rd, rs1, rs2 } => {
+                self.amo_d(rd, rs1, rs2, |a, b| a ^ b)?;
+            }
+            Inst::AmoorW { rd, rs1, rs2 } => {
+                self.amo_w(rd, rs1, rs2, |a, b| a | b)?;
+            }
+            Inst::AmoorD { rd, rs1, rs2 } => {
+                self.amo_d(rd, rs1, rs2, |a, b| a | b)?;
+            }
+            Inst::AmoandW { rd, rs1, rs2 } => {
+                self.amo_w(rd, rs1, rs2, |a, b| a & b)?;
+            }
+            Inst::AmoandD { rd, rs1, rs2 } => {
+                self.amo_d(rd, rs1, rs2, |a, b| a & b)?;
+            }
+            Inst::AmominW { rd, rs1, rs2 } => {
+                self.amo_w(rd, rs1, rs2, |a, b| (a as i32).min(b as i32) as u32)?;
+            }
+            Inst::AmominD { rd, rs1, rs2 } => {
+                self.amo_d(rd, rs1, rs2, |a, b| (a as i64).min(b as i64) as u64)?;
+            }
+            Inst::AmomaxW { rd, rs1, rs2 } => {
+                self.amo_w(rd, rs1, rs2, |a, b| (a as i32).max(b as i32) as u32)?;
+            }
+            Inst::AmomaxD { rd, rs1, rs2 } => {
+                self.amo_d(rd, rs1, rs2, |a, b| (a as i64).max(b as i64) as u64)?;
+            }
+            Inst::AmominuW { rd, rs1, rs2 } => {
+                self.amo_w(rd, rs1, rs2, |a, b| a.min(b))?;
+            }
+            Inst::AmominuD { rd, rs1, rs2 } => {
+                self.amo_d(rd, rs1, rs2, |a, b| a.min(b))?;
+            }
+            Inst::AmomaxuW { rd, rs1, rs2 } => {
+                self.amo_w(rd, rs1, rs2, |a, b| a.max(b))?;
+            }
+            Inst::AmomaxuD { rd, rs1, rs2 } => {
+                self.amo_d(rd, rs1, rs2, |a, b| a.max(b))?;
             }
             Inst::Jal { rd, offset } => {
                 self.regs[rd] = self.pc.wrapping_add(4); // link: return address
@@ -600,6 +688,47 @@ mod tests {
         cpu.regs[12] = 1;
         cpu.step().unwrap();
         assert_eq!(cpu.regs[14], 0xffff_ffff_8000_0000);
+    }
+
+    #[test]
+    fn amoadd_returns_the_old_value_and_updates_memory() {
+        // amoadd.w a4, a1, (a3) = 0x00b6a72f: one instruction does
+        // rd = mem, mem += rs2.
+        let mut cpu = cpu_with_program(&[0x00b6a72f]);
+        cpu.regs[13] = DRAM_BASE + 0x100;
+        cpu.regs[11] = 3;
+        cpu.bus.store32(DRAM_BASE + 0x100, 5).unwrap();
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 5, "rd holds the value before the add");
+        assert_eq!(cpu.bus.load32(DRAM_BASE + 0x100).unwrap(), 8);
+    }
+
+    #[test]
+    fn amo_w_sign_extends_the_old_value() {
+        // amoswap.w a4, a1, (a3) = 0x08b6a72f with old = 0x8000_0000:
+        // like LW, the 32-bit old value sign-extends into rd.
+        let mut cpu = cpu_with_program(&[0x08b6a72f]);
+        cpu.regs[13] = DRAM_BASE + 0x100;
+        cpu.regs[11] = 7;
+        cpu.bus.store32(DRAM_BASE + 0x100, 0x8000_0000).unwrap();
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 0xffff_ffff_8000_0000);
+        assert_eq!(cpu.bus.load32(DRAM_BASE + 0x100).unwrap(), 7, "swapped in");
+    }
+
+    #[test]
+    fn amomax_signed_vs_unsigned_on_the_same_bits() {
+        // Memory holds 0xffffffff: -1 to amomax.w (loses to 1), the
+        // largest u32 to amomaxu.w (beats 1).
+        // amomax.w = 0xa0b6a72f / amomaxu.w = 0xe0b6a72f
+        for (raw, expected) in [(0xa0b6a72fu32, 1u32), (0xe0b6a72f, 0xffff_ffff)] {
+            let mut cpu = cpu_with_program(&[raw]);
+            cpu.regs[13] = DRAM_BASE + 0x100;
+            cpu.regs[11] = 1;
+            cpu.bus.store32(DRAM_BASE + 0x100, 0xffff_ffff).unwrap();
+            cpu.step().unwrap();
+            assert_eq!(cpu.bus.load32(DRAM_BASE + 0x100).unwrap(), expected);
+        }
     }
 
     #[test]

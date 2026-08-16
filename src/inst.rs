@@ -158,6 +158,51 @@ pub enum Inst {
     /// REMainder Unsigned Word (sign-extended like DIVUW).
     Remuw { rd: usize, rs1: usize, rs2: usize },
 
+    // --- A extension: atomic memory operations (opcode 0x2f) ---
+    // Read-modify-write on mem[rs1] as one indivisible step: rd receives
+    // the old memory value (sign-extended for .W), memory receives
+    // op(old, rs2). On a single-hart in-order interpreter every load+store
+    // pair is already indivisible, so atomicity costs nothing here; the
+    // aq/rl ordering-hint bits are likewise no-ops and are not stored.
+    // The .W forms compute on (and store) 32 bits.
+    //
+    /// AMO ADD word: mem += rs2.
+    AmoaddW { rd: usize, rs1: usize, rs2: usize },
+    /// AMO ADD doubleword.
+    AmoaddD { rd: usize, rs1: usize, rs2: usize },
+    /// AMO SWAP word: mem = rs2 (the old value lands in rd — an exchange).
+    AmoswapW { rd: usize, rs1: usize, rs2: usize },
+    /// AMO SWAP doubleword.
+    AmoswapD { rd: usize, rs1: usize, rs2: usize },
+    /// AMO XOR word.
+    AmoxorW { rd: usize, rs1: usize, rs2: usize },
+    /// AMO XOR doubleword.
+    AmoxorD { rd: usize, rs1: usize, rs2: usize },
+    /// AMO OR word.
+    AmoorW { rd: usize, rs1: usize, rs2: usize },
+    /// AMO OR doubleword.
+    AmoorD { rd: usize, rs1: usize, rs2: usize },
+    /// AMO AND word.
+    AmoandW { rd: usize, rs1: usize, rs2: usize },
+    /// AMO AND doubleword.
+    AmoandD { rd: usize, rs1: usize, rs2: usize },
+    /// AMO MINimum word (signed compare).
+    AmominW { rd: usize, rs1: usize, rs2: usize },
+    /// AMO MINimum doubleword (signed).
+    AmominD { rd: usize, rs1: usize, rs2: usize },
+    /// AMO MAXimum word (signed).
+    AmomaxW { rd: usize, rs1: usize, rs2: usize },
+    /// AMO MAXimum doubleword (signed).
+    AmomaxD { rd: usize, rs1: usize, rs2: usize },
+    /// AMO MINimum Unsigned word.
+    AmominuW { rd: usize, rs1: usize, rs2: usize },
+    /// AMO MINimum Unsigned doubleword.
+    AmominuD { rd: usize, rs1: usize, rs2: usize },
+    /// AMO MAXimum Unsigned word.
+    AmomaxuW { rd: usize, rs1: usize, rs2: usize },
+    /// AMO MAXimum Unsigned doubleword.
+    AmomaxuD { rd: usize, rs1: usize, rs2: usize },
+
     // --- RV64I branches (B-type) ---
     // Compare rs1 with rs2 and, if the condition holds, jump pc-relative.
     // No condition-code register in RISC-V: every branch does its own compare.
@@ -312,6 +357,24 @@ impl std::fmt::Display for Inst {
             Inst::Divuw { rd, rs1, rs2 } => write!(f, "divuw x{rd}, x{rs1}, x{rs2}"),
             Inst::Remw { rd, rs1, rs2 } => write!(f, "remw x{rd}, x{rs1}, x{rs2}"),
             Inst::Remuw { rd, rs1, rs2 } => write!(f, "remuw x{rd}, x{rs1}, x{rs2}"),
+            Inst::AmoaddW { rd, rs1, rs2 } => write!(f, "amoadd.w x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmoaddD { rd, rs1, rs2 } => write!(f, "amoadd.d x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmoswapW { rd, rs1, rs2 } => write!(f, "amoswap.w x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmoswapD { rd, rs1, rs2 } => write!(f, "amoswap.d x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmoxorW { rd, rs1, rs2 } => write!(f, "amoxor.w x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmoxorD { rd, rs1, rs2 } => write!(f, "amoxor.d x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmoorW { rd, rs1, rs2 } => write!(f, "amoor.w x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmoorD { rd, rs1, rs2 } => write!(f, "amoor.d x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmoandW { rd, rs1, rs2 } => write!(f, "amoand.w x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmoandD { rd, rs1, rs2 } => write!(f, "amoand.d x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmominW { rd, rs1, rs2 } => write!(f, "amomin.w x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmominD { rd, rs1, rs2 } => write!(f, "amomin.d x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmomaxW { rd, rs1, rs2 } => write!(f, "amomax.w x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmomaxD { rd, rs1, rs2 } => write!(f, "amomax.d x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmominuW { rd, rs1, rs2 } => write!(f, "amominu.w x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmominuD { rd, rs1, rs2 } => write!(f, "amominu.d x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmomaxuW { rd, rs1, rs2 } => write!(f, "amomaxu.w x{rd}, x{rs2}, (x{rs1})"),
+            Inst::AmomaxuD { rd, rs1, rs2 } => write!(f, "amomaxu.d x{rd}, x{rs2}, (x{rs1})"),
             Inst::Beq { rs1, rs2, offset } => write!(f, "beq x{rs1}, x{rs2}, {offset}"),
             Inst::Bne { rs1, rs2, offset } => write!(f, "bne x{rs1}, x{rs2}, {offset}"),
             Inst::Blt { rs1, rs2, offset } => write!(f, "blt x{rs1}, x{rs2}, {offset}"),
@@ -420,6 +483,35 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
                 0x6 => Ok(Inst::Bltu { rs1, rs2, offset }),
                 0x7 => Ok(Inst::Bgeu { rs1, rs2, offset }),
                 // funct3 2 and 3 are unused in the BRANCH opcode
+                _ => Err(Exception::IllegalInstruction(raw)),
+            }
+        }
+        // AMO (A extension): R-type with funct7 split into funct5 | aq | rl.
+        // The aq/rl ordering hints are meaningless on this in-order
+        // single-hart interpreter, so any combination is accepted and
+        // dropped. funct3 selects the width: 2 = .W, 3 = .D.
+        0x2f => {
+            let funct5 = raw >> 27;
+            match (funct3, funct5) {
+                (0x2, 0b00000) => Ok(Inst::AmoaddW { rd, rs1, rs2 }),
+                (0x3, 0b00000) => Ok(Inst::AmoaddD { rd, rs1, rs2 }),
+                (0x2, 0b00001) => Ok(Inst::AmoswapW { rd, rs1, rs2 }),
+                (0x3, 0b00001) => Ok(Inst::AmoswapD { rd, rs1, rs2 }),
+                (0x2, 0b00100) => Ok(Inst::AmoxorW { rd, rs1, rs2 }),
+                (0x3, 0b00100) => Ok(Inst::AmoxorD { rd, rs1, rs2 }),
+                (0x2, 0b01000) => Ok(Inst::AmoorW { rd, rs1, rs2 }),
+                (0x3, 0b01000) => Ok(Inst::AmoorD { rd, rs1, rs2 }),
+                (0x2, 0b01100) => Ok(Inst::AmoandW { rd, rs1, rs2 }),
+                (0x3, 0b01100) => Ok(Inst::AmoandD { rd, rs1, rs2 }),
+                (0x2, 0b10000) => Ok(Inst::AmominW { rd, rs1, rs2 }),
+                (0x3, 0b10000) => Ok(Inst::AmominD { rd, rs1, rs2 }),
+                (0x2, 0b10100) => Ok(Inst::AmomaxW { rd, rs1, rs2 }),
+                (0x3, 0b10100) => Ok(Inst::AmomaxD { rd, rs1, rs2 }),
+                (0x2, 0b11000) => Ok(Inst::AmominuW { rd, rs1, rs2 }),
+                (0x3, 0b11000) => Ok(Inst::AmominuD { rd, rs1, rs2 }),
+                (0x2, 0b11100) => Ok(Inst::AmomaxuW { rd, rs1, rs2 }),
+                (0x3, 0b11100) => Ok(Inst::AmomaxuD { rd, rs1, rs2 }),
+                // funct5 00010/00011 are LR/SC: the next step.
                 _ => Err(Exception::IllegalInstruction(raw)),
             }
         }
@@ -883,6 +975,82 @@ mod tests {
         assert_eq!(
             decode_checked(0b0000001_01100_01011_111_01110_0111011, 0x02c5f73b).unwrap(),
             Inst::Remuw { rd: 14, rs1: 11, rs2: 12 }
+        );
+    }
+
+    #[test]
+    fn decodes_amos() {
+        // AMO: funct5_aq_rl_rs2_rs1_funct3_rd_opcode
+        // funct3 picks the width (010 = .w, 011 = .d); aq/rl stay 0 in the
+        // rv64ua-p encodings. All operands a4, a1, (a3) = x14, x11, (x13).
+        let cases: &[(u32, u32, fn(usize, usize, usize) -> Inst)] = &[
+            (0b00000_0_0_01011_01101_010_01110_0101111, 0x00b6a72f, |rd, rs1, rs2| {
+                Inst::AmoaddW { rd, rs1, rs2 }
+            }),
+            (0b00000_0_0_01011_01101_011_01110_0101111, 0x00b6b72f, |rd, rs1, rs2| {
+                Inst::AmoaddD { rd, rs1, rs2 }
+            }),
+            (0b00001_0_0_01011_01101_010_01110_0101111, 0x08b6a72f, |rd, rs1, rs2| {
+                Inst::AmoswapW { rd, rs1, rs2 }
+            }),
+            (0b00001_0_0_01011_01101_011_01110_0101111, 0x08b6b72f, |rd, rs1, rs2| {
+                Inst::AmoswapD { rd, rs1, rs2 }
+            }),
+            (0b00100_0_0_01011_01101_010_01110_0101111, 0x20b6a72f, |rd, rs1, rs2| {
+                Inst::AmoxorW { rd, rs1, rs2 }
+            }),
+            (0b00100_0_0_01011_01101_011_01110_0101111, 0x20b6b72f, |rd, rs1, rs2| {
+                Inst::AmoxorD { rd, rs1, rs2 }
+            }),
+            (0b01000_0_0_01011_01101_010_01110_0101111, 0x40b6a72f, |rd, rs1, rs2| {
+                Inst::AmoorW { rd, rs1, rs2 }
+            }),
+            (0b01000_0_0_01011_01101_011_01110_0101111, 0x40b6b72f, |rd, rs1, rs2| {
+                Inst::AmoorD { rd, rs1, rs2 }
+            }),
+            (0b01100_0_0_01011_01101_010_01110_0101111, 0x60b6a72f, |rd, rs1, rs2| {
+                Inst::AmoandW { rd, rs1, rs2 }
+            }),
+            (0b01100_0_0_01011_01101_011_01110_0101111, 0x60b6b72f, |rd, rs1, rs2| {
+                Inst::AmoandD { rd, rs1, rs2 }
+            }),
+            (0b10000_0_0_01011_01101_010_01110_0101111, 0x80b6a72f, |rd, rs1, rs2| {
+                Inst::AmominW { rd, rs1, rs2 }
+            }),
+            (0b10000_0_0_01011_01101_011_01110_0101111, 0x80b6b72f, |rd, rs1, rs2| {
+                Inst::AmominD { rd, rs1, rs2 }
+            }),
+            (0b10100_0_0_01011_01101_010_01110_0101111, 0xa0b6a72f, |rd, rs1, rs2| {
+                Inst::AmomaxW { rd, rs1, rs2 }
+            }),
+            (0b10100_0_0_01011_01101_011_01110_0101111, 0xa0b6b72f, |rd, rs1, rs2| {
+                Inst::AmomaxD { rd, rs1, rs2 }
+            }),
+            (0b11000_0_0_01011_01101_010_01110_0101111, 0xc0b6a72f, |rd, rs1, rs2| {
+                Inst::AmominuW { rd, rs1, rs2 }
+            }),
+            (0b11000_0_0_01011_01101_011_01110_0101111, 0xc0b6b72f, |rd, rs1, rs2| {
+                Inst::AmominuD { rd, rs1, rs2 }
+            }),
+            (0b11100_0_0_01011_01101_010_01110_0101111, 0xe0b6a72f, |rd, rs1, rs2| {
+                Inst::AmomaxuW { rd, rs1, rs2 }
+            }),
+            (0b11100_0_0_01011_01101_011_01110_0101111, 0xe0b6b72f, |rd, rs1, rs2| {
+                Inst::AmomaxuD { rd, rs1, rs2 }
+            }),
+        ];
+        for (binary, hex, expect) in cases {
+            assert_eq!(decode_checked(*binary, *hex).unwrap(), expect(14, 13, 11));
+        }
+        // The aq/rl hint bits decode fine (amoswap.w.aq.rl per objdump).
+        assert_eq!(
+            decode_checked(0b00001_1_1_01011_01101_010_01110_0101111, 0x0eb6a72f).unwrap(),
+            Inst::AmoswapW { rd: 14, rs1: 13, rs2: 11 }
+        );
+        // LR/SC (funct5 00010/00011) wait for the next step.
+        assert_eq!(
+            decode_checked(0b00010_0_0_00000_01101_010_01110_0101111, 0x1006a72f),
+            Err(Exception::IllegalInstruction(0x1006a72f))
         );
     }
 

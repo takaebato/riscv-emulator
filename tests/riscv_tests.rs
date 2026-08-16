@@ -41,6 +41,20 @@ fn suite(prefix: &str) -> Vec<String> {
 }
 
 #[test]
+fn the_rv64ua_p_amo_family_passes() {
+    // Widens to suite("rv64ua-p-") once LR/SC lands.
+    let failures: Vec<_> = suite("rv64ua-p-amo")
+        .into_iter()
+        .map(|name| {
+            let outcome = run_isa_test(&name);
+            (name, outcome)
+        })
+        .filter(|(_, outcome)| *outcome != Outcome::Pass)
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
 fn the_whole_rv64um_p_suite_passes() {
     let failures: Vec<_> = suite("rv64um-p-")
         .into_iter()
