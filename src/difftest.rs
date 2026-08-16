@@ -21,6 +21,7 @@
 
 use crate::cpu::Cpu;
 use crate::exception::Exception;
+use crate::inst::{Inst, decode};
 
 /// One line of Spike's log that matters for the comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +136,20 @@ pub fn run(cpu: &mut Cpu, events: &[Event]) -> DiffResult {
             return DiffResult::Diverged { index, kind };
         }
         match event {
-            Event::Commit { write, .. } => {
+            Event::Commit { raw, write, .. } => {
+                // A store-conditional may fail spuriously: the spec lets
+                // the environment drop a reservation at any time, and
+                // Spike does so on its internal scheduling boundaries.
+                // When the log shows a failed SC, drop our reservation
+                // too, so both implementations take the same
+                // architecturally-legal path.
+                if let (Ok(Inst::ScW { .. } | Inst::ScD { .. }), Some((_, result))) =
+                    (decode(*raw), write)
+                {
+                    if *result != 0 {
+                        cpu.reservation = None;
+                    }
+                }
                 if let Err(e) = cpu.step() {
                     let kind = Divergence::OurException(e);
                     return DiffResult::Diverged { index, kind };
@@ -287,6 +301,23 @@ core   0: >>>>  write_tohost
             run(&mut cpu, &events),
             DiffResult::LockstepUntilEcall { instructions: 1 }
         );
+    }
+
+    #[test]
+    fn follows_spike_through_a_spurious_sc_failure() {
+        // lr.w a4, (a0) then sc.w a4, a5, (a0): our sc would succeed, but
+        // the log says Spike's failed (a legal spurious failure). The
+        // runner drops our reservation so both fail identically, and the
+        // store must not happen.
+        let mut cpu = cpu_with_program(&[0x1005272f, 0x18f5272f]);
+        cpu.regs[10] = DRAM_BASE + 0x100;
+        cpu.regs[15] = 99;
+        let events = vec![
+            Event::Commit { pc: DRAM_BASE, raw: 0x1005272f, write: Some((14, 0)) },
+            Event::Commit { pc: DRAM_BASE + 4, raw: 0x18f5272f, write: Some((14, 1)) },
+        ];
+        assert_eq!(run(&mut cpu, &events), DiffResult::Lockstep { instructions: 2 });
+        assert_eq!(cpu.bus.load32(DRAM_BASE + 0x100).unwrap(), 0, "no store");
     }
 
     #[test]

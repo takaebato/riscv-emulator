@@ -203,6 +203,23 @@ pub enum Inst {
     /// AMO MAXimum Unsigned doubleword.
     AmomaxuD { rd: usize, rs1: usize, rs2: usize },
 
+    // --- A extension: load-reserved / store-conditional ---
+    // The build-your-own-atomic pair: LR loads and registers a reservation
+    // on the address; SC stores only if the reservation still stands,
+    // reporting success (0) or failure (1) in rd. Software retries the
+    // whole LR..SC sequence on failure, so any read-modify-write can be
+    // made atomic — this is how compare-and-swap is built on RISC-V.
+    //
+    /// Load-Reserved Word: `rd = sign-extended mem[rs1]`, reserve the address.
+    LrW { rd: usize, rs1: usize },
+    /// Load-Reserved Doubleword.
+    LrD { rd: usize, rs1: usize },
+    /// Store-Conditional Word: if reserved, `mem[rs1] = rs2 low 32; rd = 0`,
+    /// else `rd = 1`. Always drops the reservation.
+    ScW { rd: usize, rs1: usize, rs2: usize },
+    /// Store-Conditional Doubleword.
+    ScD { rd: usize, rs1: usize, rs2: usize },
+
     // --- RV64I branches (B-type) ---
     // Compare rs1 with rs2 and, if the condition holds, jump pc-relative.
     // No condition-code register in RISC-V: every branch does its own compare.
@@ -375,6 +392,10 @@ impl std::fmt::Display for Inst {
             Inst::AmominuD { rd, rs1, rs2 } => write!(f, "amominu.d x{rd}, x{rs2}, (x{rs1})"),
             Inst::AmomaxuW { rd, rs1, rs2 } => write!(f, "amomaxu.w x{rd}, x{rs2}, (x{rs1})"),
             Inst::AmomaxuD { rd, rs1, rs2 } => write!(f, "amomaxu.d x{rd}, x{rs2}, (x{rs1})"),
+            Inst::LrW { rd, rs1 } => write!(f, "lr.w x{rd}, (x{rs1})"),
+            Inst::LrD { rd, rs1 } => write!(f, "lr.d x{rd}, (x{rs1})"),
+            Inst::ScW { rd, rs1, rs2 } => write!(f, "sc.w x{rd}, x{rs2}, (x{rs1})"),
+            Inst::ScD { rd, rs1, rs2 } => write!(f, "sc.d x{rd}, x{rs2}, (x{rs1})"),
             Inst::Beq { rs1, rs2, offset } => write!(f, "beq x{rs1}, x{rs2}, {offset}"),
             Inst::Bne { rs1, rs2, offset } => write!(f, "bne x{rs1}, x{rs2}, {offset}"),
             Inst::Blt { rs1, rs2, offset } => write!(f, "blt x{rs1}, x{rs2}, {offset}"),
@@ -511,7 +532,12 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
                 (0x3, 0b11000) => Ok(Inst::AmominuD { rd, rs1, rs2 }),
                 (0x2, 0b11100) => Ok(Inst::AmomaxuW { rd, rs1, rs2 }),
                 (0x3, 0b11100) => Ok(Inst::AmomaxuD { rd, rs1, rs2 }),
-                // funct5 00010/00011 are LR/SC: the next step.
+                // LR carries no source operand: rs2 is hardwired zero and
+                // anything else is a reserved encoding.
+                (0x2, 0b00010) if rs2 == 0 => Ok(Inst::LrW { rd, rs1 }),
+                (0x3, 0b00010) if rs2 == 0 => Ok(Inst::LrD { rd, rs1 }),
+                (0x2, 0b00011) => Ok(Inst::ScW { rd, rs1, rs2 }),
+                (0x3, 0b00011) => Ok(Inst::ScD { rd, rs1, rs2 }),
                 _ => Err(Exception::IllegalInstruction(raw)),
             }
         }
@@ -1047,10 +1073,33 @@ mod tests {
             decode_checked(0b00001_1_1_01011_01101_010_01110_0101111, 0x0eb6a72f).unwrap(),
             Inst::AmoswapW { rd: 14, rs1: 13, rs2: 11 }
         );
-        // LR/SC (funct5 00010/00011) wait for the next step.
+    }
+
+    #[test]
+    fn decodes_lr_sc() {
+        // AMO: funct5_aq_rl_rs2_rs1_funct3_rd_opcode
+        // lr.w a4, (a0) / sc.w a4, a5, (a0) straight from rv64ua-p-lrsc;
+        // the .d forms are hand-assembled (funct3 011).
         assert_eq!(
-            decode_checked(0b00010_0_0_00000_01101_010_01110_0101111, 0x1006a72f),
-            Err(Exception::IllegalInstruction(0x1006a72f))
+            decode_checked(0b00010_0_0_00000_01010_010_01110_0101111, 0x1005272f).unwrap(),
+            Inst::LrW { rd: 14, rs1: 10 }
+        );
+        assert_eq!(
+            decode_checked(0b00011_0_0_01111_01010_010_01110_0101111, 0x18f5272f).unwrap(),
+            Inst::ScW { rd: 14, rs1: 10, rs2: 15 }
+        );
+        assert_eq!(
+            decode_checked(0b00010_0_0_00000_01010_011_01110_0101111, 0x1005372f).unwrap(),
+            Inst::LrD { rd: 14, rs1: 10 }
+        );
+        assert_eq!(
+            decode_checked(0b00011_0_0_01111_01010_011_01110_0101111, 0x18f5372f).unwrap(),
+            Inst::ScD { rd: 14, rs1: 10, rs2: 15 }
+        );
+        // LR's rs2 field is hardwired zero: anything else is reserved.
+        assert_eq!(
+            decode_checked(0b00010_0_0_00001_01010_010_01110_0101111, 0x1015272f),
+            Err(Exception::IllegalInstruction(0x1015272f))
         );
     }
 

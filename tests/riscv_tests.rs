@@ -41,9 +41,8 @@ fn suite(prefix: &str) -> Vec<String> {
 }
 
 #[test]
-fn the_rv64ua_p_amo_family_passes() {
-    // Widens to suite("rv64ua-p-") once LR/SC lands.
-    let failures: Vec<_> = suite("rv64ua-p-amo")
+fn the_whole_rv64ua_p_suite_passes() {
+    let failures: Vec<_> = suite("rv64ua-p-")
         .into_iter()
         .map(|name| {
             let outcome = run_isa_test(&name);

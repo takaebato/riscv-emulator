@@ -30,6 +30,11 @@ pub struct Cpu {
     /// Deliberately simplified: unimplemented CSRs should raise illegal-instruction
     /// (needed by rv64mi-p-csr, phase 3) but here they all read as 0.
     pub csrs: [u64; 4096],
+    /// The LR/SC reservation: the address the last LR registered, if no SC
+    /// has consumed it yet. Single-hart, so no other-hart invalidation
+    /// exists; interrupts (phase 3) land between instructions and leave it
+    /// alone, matching the spec's allowance.
+    pub reservation: Option<u64>,
     pub bus: Bus,
 }
 
@@ -39,6 +44,7 @@ impl Cpu {
             regs: [0; 32],
             pc: 0,
             csrs: [0; 4096],
+            reservation: None,
             bus: Bus::new(),
         }
     }
@@ -365,6 +371,37 @@ impl Cpu {
             }
             Inst::AmomaxuD { rd, rs1, rs2 } => {
                 self.amo_d(rd, rs1, rs2, |a, b| a.max(b))?;
+            }
+            // LR/SC: the reservation is only taken after the load clears
+            // its fault check, and SC drops it no matter which way it goes
+            // (a failed SC must not leave a live reservation behind).
+            Inst::LrW { rd, rs1 } => {
+                let addr = self.regs[rs1];
+                self.regs[rd] = self.bus.load32(addr)? as i32 as u64;
+                self.reservation = Some(addr);
+            }
+            Inst::LrD { rd, rs1 } => {
+                let addr = self.regs[rs1];
+                self.regs[rd] = self.bus.load64(addr)?;
+                self.reservation = Some(addr);
+            }
+            Inst::ScW { rd, rs1, rs2 } => {
+                let addr = self.regs[rs1];
+                if self.reservation.take() == Some(addr) {
+                    self.bus.store32(addr, self.regs[rs2] as u32)?;
+                    self.regs[rd] = 0;
+                } else {
+                    self.regs[rd] = 1;
+                }
+            }
+            Inst::ScD { rd, rs1, rs2 } => {
+                let addr = self.regs[rs1];
+                if self.reservation.take() == Some(addr) {
+                    self.bus.store64(addr, self.regs[rs2])?;
+                    self.regs[rd] = 0;
+                } else {
+                    self.regs[rd] = 1;
+                }
             }
             Inst::Jal { rd, offset } => {
                 self.regs[rd] = self.pc.wrapping_add(4); // link: return address
@@ -729,6 +766,50 @@ mod tests {
             cpu.step().unwrap();
             assert_eq!(cpu.bus.load32(DRAM_BASE + 0x100).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn lr_sc_pair_succeeds_and_stores() {
+        // lr.w a4, (a0) = 0x1005272f then sc.w a4, a5, (a0) = 0x18f5272f:
+        // the reservation from lr lets sc through, rd reads 0 (success).
+        let mut cpu = cpu_with_program(&[0x1005272f, 0x18f5272f]);
+        cpu.regs[10] = DRAM_BASE + 0x100;
+        cpu.regs[15] = 99;
+        cpu.bus.store32(DRAM_BASE + 0x100, 5).unwrap();
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 5, "lr loaded the old value");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 0, "sc reports success");
+        assert_eq!(cpu.bus.load32(DRAM_BASE + 0x100).unwrap(), 99);
+    }
+
+    #[test]
+    fn sc_without_reservation_fails_and_does_not_store() {
+        let mut cpu = cpu_with_program(&[0x18f5272f]);
+        cpu.regs[10] = DRAM_BASE + 0x100;
+        cpu.regs[15] = 99;
+        cpu.bus.store32(DRAM_BASE + 0x100, 5).unwrap();
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[14], 1, "sc reports failure");
+        assert_eq!(cpu.bus.load32(DRAM_BASE + 0x100).unwrap(), 5, "untouched");
+    }
+
+    #[test]
+    fn sc_to_a_different_address_fails_and_consumes_the_reservation() {
+        // lr on one address, sc on another: the sc fails, and because any
+        // sc drops the reservation, a second sc back on the reserved
+        // address fails too.
+        let mut cpu = cpu_with_program(&[0x1005272f, 0x18f5272f, 0x18f5272f]);
+        cpu.regs[10] = DRAM_BASE + 0x100;
+        cpu.regs[15] = 99;
+        cpu.step().unwrap(); // lr.w at +0x100
+        cpu.regs[10] = DRAM_BASE + 0x200;
+        cpu.step().unwrap(); // sc.w at +0x200: wrong address
+        assert_eq!(cpu.regs[14], 1, "address mismatch fails");
+        cpu.regs[10] = DRAM_BASE + 0x100;
+        cpu.step().unwrap(); // sc.w back at +0x100: reservation is gone
+        assert_eq!(cpu.regs[14], 1, "the failed sc consumed the reservation");
+        assert_eq!(cpu.bus.load32(DRAM_BASE + 0x100).unwrap(), 0, "never stored");
     }
 
     #[test]
