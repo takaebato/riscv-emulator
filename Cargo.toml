@@ -3,6 +3,7 @@ name = "riscv-emulator"
 version = "0.1.0"
 edition = "2024"
 publish = false # guard against accidental publish; flip when cutting the first crates.io release
+default-run = "riscv-emulator" # bare `cargo run` means the emulator, not the difftest driver
 
 [dependencies]
 object = "0.39.1"
