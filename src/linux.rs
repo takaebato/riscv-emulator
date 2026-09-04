@@ -12,7 +12,7 @@
 
 use crate::cpu::Cpu;
 use crate::exception::Exception;
-use crate::inst::{Inst, decode};
+use crate::inst::Inst;
 
 // Linux riscv64 syscall numbers (the generic asm-generic table), as needed.
 const SYS_WRITE: u64 = 64;
@@ -61,8 +61,8 @@ impl std::fmt::Display for Outcome {
 /// Guest writes to stdout/stderr both land in `out`.
 pub fn run(cpu: &mut Cpu, out: &mut dyn std::io::Write, step_limit: u64) -> Outcome {
     for _ in 0..step_limit {
-        let inst = match cpu.fetch().and_then(decode) {
-            Ok(inst) => inst,
+        let (inst, len) = match cpu.fetch_decode() {
+            Ok((inst, len, _)) => (inst, len),
             Err(e) => return Outcome::Exception { pc: cpu.pc, e },
         };
         if let Inst::Ecall = inst {
@@ -79,8 +79,8 @@ pub fn run(cpu: &mut Cpu, out: &mut dyn std::io::Write, step_limit: u64) -> Outc
             }
             // The syscall is the ecall's execution: retire it like any
             // other non-jump instruction.
-            cpu.pc = cpu.pc.wrapping_add(4);
-        } else if let Err(e) = cpu.execute(inst) {
+            cpu.pc = cpu.pc.wrapping_add(len);
+        } else if let Err(e) = cpu.execute(inst, len) {
             return Outcome::Exception { pc: cpu.pc, e };
         }
     }

@@ -3,7 +3,7 @@
 
 use crate::bus::Bus;
 use crate::exception::Exception;
-use crate::inst::{Inst, decode};
+use crate::inst::{Inst, decode, decode_compressed};
 use crate::loader::LoadedElf;
 
 /// CSR address of mtvec (Machine Trap VECtor): where traps jump to.
@@ -60,17 +60,27 @@ impl Cpu {
         Ok(())
     }
 
-    /// Fetch the 32-bit instruction word at pc.
-    /// Will change to 16-bit parcel fetching when the C extension lands (phase 2).
-    pub fn fetch(&self) -> Result<u32, Exception> {
-        self.bus.load32(self.pc)
+    /// Fetch and decode the instruction at pc: the decoded Inst, its byte
+    /// length (2 or 4), and the raw bits (16-bit parcels zero-extended)
+    /// for tracing.
+    ///
+    /// With the C extension, instructions come in 16-bit parcels: the low
+    /// 2 bits of the first parcel say which kind this is (11 = a full
+    /// 32-bit instruction, anything else = compressed).
+    pub fn fetch_decode(&self) -> Result<(Inst, u64, u32), Exception> {
+        let parcel = self.bus.load16(self.pc)?;
+        if parcel & 0b11 == 0b11 {
+            let raw = self.bus.load32(self.pc)?;
+            Ok((decode(raw)?, 4, raw))
+        } else {
+            Ok((decode_compressed(parcel)?, 2, parcel as u32))
+        }
     }
 
     /// One turn of the interpreter loop: fetch → decode → execute.
     pub fn step(&mut self) -> Result<(), Exception> {
-        let raw = self.fetch()?;
-        let inst = decode(raw)?;
-        self.execute(inst)
+        let (inst, len, _) = self.fetch_decode()?;
+        self.execute(inst, len)
     }
 
     /// Take a trap: record what happened in the CSRs and redirect pc to the
@@ -129,10 +139,12 @@ impl Cpu {
     /// Execute one decoded instruction: update registers and advance pc.
     ///
     /// During execution `self.pc` still points at the current instruction (jumps and
-    /// AUIPC need it); the new pc is committed at the very end.
-    pub fn execute(&mut self, inst: Inst) -> Result<(), Exception> {
+    /// AUIPC need it); the new pc is committed at the very end. `len` is the
+    /// instruction's byte length (2 for compressed, 4 for full width): it sets
+    /// the straight-line advance and the link address of jumps.
+    pub fn execute(&mut self, inst: Inst, len: u64) -> Result<(), Exception> {
         // Straight-line default; jump/branch instructions overwrite this.
-        let mut next_pc = self.pc.wrapping_add(4);
+        let mut next_pc = self.pc.wrapping_add(len);
 
         match inst {
             Inst::Addi { rd, rs1, imm } => {
@@ -404,7 +416,9 @@ impl Cpu {
                 }
             }
             Inst::Jal { rd, offset } => {
-                self.regs[rd] = self.pc.wrapping_add(4); // link: return address
+                // Link the return address: the instruction after this one,
+                // pc + len (a compressed c.jalr links pc + 2).
+                self.regs[rd] = self.pc.wrapping_add(len);
                 next_pc = self.pc.wrapping_add(offset as u64);
             }
             Inst::Jalr { rd, rs1, offset } => {
@@ -413,7 +427,7 @@ impl Cpu {
                 // clearing bit 0 of the computed target (JAL cannot even
                 // encode an odd offset, but a register sum can be odd).
                 let target = self.regs[rs1].wrapping_add(offset as u64) & !1;
-                self.regs[rd] = self.pc.wrapping_add(4); // link: return address
+                self.regs[rd] = self.pc.wrapping_add(len); // link: return address
                 next_pc = target;
             }
             // Branches: on a taken branch the offset replaces the straight-line
@@ -810,6 +824,24 @@ mod tests {
         cpu.step().unwrap(); // sc.w back at +0x100: reservation is gone
         assert_eq!(cpu.regs[14], 1, "the failed sc consumed the reservation");
         assert_eq!(cpu.bus.load32(DRAM_BASE + 0x100).unwrap(), 0, "never stored");
+    }
+
+    #[test]
+    fn mixed_width_instructions_advance_pc_correctly() {
+        // c.addi a0, -3 (2 bytes) followed by addi a0, a0, 1 (4 bytes):
+        // fetch reads 16-bit parcels and the pc advances by each
+        // instruction's own length.
+        let mut cpu = Cpu::new();
+        cpu.bus.store16(DRAM_BASE, 0x1575).unwrap(); // c.addi a0, -3
+        cpu.bus.store32(DRAM_BASE + 2, 0x00150513).unwrap(); // addi a0, a0, 1
+        cpu.pc = DRAM_BASE;
+        cpu.regs[10] = 10;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[10], 7);
+        assert_eq!(cpu.pc, DRAM_BASE + 2, "compressed: pc += 2");
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[10], 8);
+        assert_eq!(cpu.pc, DRAM_BASE + 6, "full width: pc += 4");
     }
 
     #[test]

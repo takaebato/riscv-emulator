@@ -3,7 +3,7 @@
 //! anything else runs under Linux user-mode emulation (untraced, so the
 //! guest owns stdout).
 
-use riscv_emulator::{cpu::Cpu, harness, inst, linux, loader};
+use riscv_emulator::{cpu::Cpu, harness, linux, loader};
 
 /// Safety cap so a legal infinite loop cannot hang the demo.
 const STEP_LIMIT: u64 = 10_000;
@@ -34,12 +34,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pc = cpu.pc;
         // fetch/decode by hand (instead of cpu.step()) so the trace can show the
         // instruction before executing it.
-        let stop = match cpu.fetch().and_then(|raw| {
-            inst::decode(raw).map(|inst| (raw, inst))
-        }) {
-            Ok((raw, inst)) => {
+        let stop = match cpu.fetch_decode() {
+            Ok((inst, len, raw)) => {
                 println!("{pc:#010x}: {raw:08x}  {inst}");
-                cpu.execute(inst).err()
+                cpu.execute(inst, len).err()
             }
             Err(e) => Some(e),
         };

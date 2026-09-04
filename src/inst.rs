@@ -702,6 +702,39 @@ fn imm_j(raw: u32) -> i64 {
     ((imm << 43) as i64) >> 43
 }
 
+/// Decode a 16-bit compressed parcel (C extension) into the same Inst its
+/// 32-bit expansion would decode to. The spec defines every compressed
+/// instruction as an alias of a full-width one, so execute never needs to
+/// know compression exists: only fetch (parcel size) and the pc advance
+/// (len = 2) see the difference.
+///
+/// Layout: op = parcel[1:0] picks the quadrant (11 would be a full-width
+/// instruction and never reaches here), funct3 = parcel[15:13] the row.
+/// Growing quadrant by quadrant, like decode() grew opcode by opcode.
+pub fn decode_compressed(parcel: u16) -> Result<Inst, Exception> {
+    let op = parcel & 0b11;
+    let funct3 = parcel >> 13;
+    // The full-width register field (bits 11:7), used by quadrant 1/2 forms.
+    let rd_full = ((parcel >> 7) & 0x1f) as usize;
+    match (op, funct3) {
+        // C.ADDI: addi rd, rd, imm6. rd=0 imm=0 is the canonical C.NOP;
+        // other rd=0 forms are HINTs, which execute fine as addi x0.
+        (0b01, 0b000) => Ok(Inst::Addi {
+            rd: rd_full,
+            rs1: rd_full,
+            imm: imm_ci(parcel),
+        }),
+        _ => Err(Exception::IllegalInstruction(parcel as u32)),
+    }
+}
+
+/// CI-format immediate: parcel[12] = imm[5] (the sign), parcel[6:2] =
+/// imm[4:0]. Six bits, sign-extended.
+fn imm_ci(parcel: u16) -> i64 {
+    let imm = ((((parcel >> 12) & 0x1) << 5) | ((parcel >> 2) & 0x1f)) as u64;
+    ((imm << 58) as i64) >> 58
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1253,6 +1286,26 @@ mod tests {
         );
         // ...but the pure read (csrrs with rs1=x0, f3=010) is fine.
         assert!(decode(0xf1402573).is_ok());
+    }
+
+    #[test]
+    fn decodes_compressed_addi() {
+        // CI format: funct3_imm[5]_rd_imm[4:0]_op
+        // c.nop = c.addi x0, 0 — the canonical 16-bit no-op.
+        assert_eq!(
+            decode_compressed(0b000_0_00000_00000_01).unwrap(),
+            Inst::Addi { rd: 0, rs1: 0, imm: 0 }
+        );
+        // c.addi a0, -3 (rd doubles as rs1; imm6 sign-extends: 111101 = -3)
+        assert_eq!(
+            decode_compressed(0b000_1_01010_11101_01).unwrap(),
+            Inst::Addi { rd: 10, rs1: 10, imm: -3 }
+        );
+        // Quadrants not yet populated stay illegal (this is c.lw's slot).
+        assert_eq!(
+            decode_compressed(0b010_0_00000_00000_00),
+            Err(Exception::IllegalInstruction(0b010_0_00000_00000_00))
+        );
     }
 
     #[test]

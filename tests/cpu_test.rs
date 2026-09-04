@@ -23,7 +23,8 @@ fn power_on_and_fetch_first_instruction() {
     // The fetched instruction word matches the first 4 bytes of the ELF code segment
     // (i.e. the copy into the Bus is faithful).
     let expected = u32::from_le_bytes(elf.segments[0].data[0..4].try_into().unwrap());
-    let inst = cpu.fetch().unwrap();
-    assert_eq!(inst, expected);
-    assert_ne!(inst, 0, "first instruction must not be 0 (invalid)");
+    let (_, len, raw) = cpu.fetch_decode().unwrap();
+    assert_eq!(raw, expected);
+    assert_eq!(len, 4, "the boot jump is a full-width instruction");
+    assert_ne!(raw, 0, "first instruction must not be 0 (invalid)");
 }
