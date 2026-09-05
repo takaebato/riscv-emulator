@@ -31,6 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut executed = 0u64;
     while executed < STEP_LIMIT {
+        cpu.tick();
+        if cpu.take_pending_interrupt() {
+            println!("{:#010x}: --------  [interrupt: mcause {:#x}]", cpu.csrs[0x341], cpu.csrs[0x342]);
+        }
         let pc = cpu.pc;
         // fetch/decode by hand (instead of cpu.step()) so the trace can show the
         // instruction before executing it.

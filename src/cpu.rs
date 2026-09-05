@@ -129,10 +129,31 @@ impl Cpu {
         Ok((inst, len, raw))
     }
 
-    /// One turn of the interpreter loop: take a pending interrupt if any,
-    /// then fetch → decode → execute (an interrupt redirects pc first, so
-    /// the instruction executed is the handler's).
+    /// Advance the machine's clock by one instruction's worth of time and
+    /// mirror the devices' interrupt lines into mip. On real hardware these
+    /// are wires (the CLINT's outputs are the MSIP/MTIP bits); here the
+    /// wiring runs once per step.
+    pub fn tick(&mut self) {
+        self.bus.clint.mtime = self.bus.clint.mtime.wrapping_add(1);
+        let mut mip = self.csrs[MIP_CSR];
+        if self.bus.clint.msip & 1 != 0 {
+            mip |= 1 << 3;
+        } else {
+            mip &= !(1 << 3);
+        }
+        if self.bus.clint.mtime >= self.bus.clint.mtimecmp {
+            mip |= 1 << 7;
+        } else {
+            mip &= !(1 << 7);
+        }
+        self.csrs[MIP_CSR] = mip;
+    }
+
+    /// One turn of the interpreter loop: advance time, take a pending
+    /// interrupt if any, then fetch → decode → execute (an interrupt
+    /// redirects pc first, so the instruction executed is the handler's).
     pub fn step(&mut self) -> Result<(), Exception> {
+        self.tick();
         self.take_pending_interrupt();
         let (inst, len, _) = self.fetch_decode()?;
         self.execute(inst, len)
@@ -751,7 +772,7 @@ impl Default for Cpu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::DRAM_BASE;
+    use crate::bus::{CLINT_BASE, DRAM_BASE};
 
     /// Write instruction words at DRAM_BASE and point pc there.
     fn cpu_with_program(insts: &[u32]) -> Cpu {
@@ -1388,6 +1409,43 @@ mod tests {
         assert_eq!(cpu.regs[1], 2, "preempted despite MIE = 0");
         assert_eq!((cpu.csrs[MSTATUS] >> 11) & 0b11, 0, "MPP recorded U");
         assert_eq!(cpu.privilege, PrivilegeMode::Machine);
+    }
+
+    #[test]
+    fn the_clock_fires_a_timer_interrupt_at_mtimecmp() {
+        // Program the one-shot alarm for time 3, then run. mtime advances
+        // one per step: two instructions run undisturbed, the third step
+        // is preempted into the handler.
+        let mut cpu =
+            cpu_with_program(&[0x00000013, 0x00000013, 0x00000013, 0x00000013]); // nops
+        cpu.bus.store64(CLINT_BASE + 0x4000, 3).unwrap(); // mtimecmp = 3
+        cpu.csrs[MIE_CSR] = 1 << 7;
+        cpu.csrs[MSTATUS] |= 1 << 3;
+        cpu.csrs[MTVEC] = DRAM_BASE + 0x40;
+        cpu.bus.store32(DRAM_BASE + 0x40, 0x00200093).unwrap(); // addi x1, x0, 2
+        cpu.step().unwrap(); // mtime 1
+        cpu.step().unwrap(); // mtime 2
+        assert_eq!(cpu.pc, DRAM_BASE + 8, "ran undisturbed before the alarm");
+        cpu.step().unwrap(); // mtime 3: preempted
+        assert_eq!(cpu.regs[1], 2, "handler ran");
+        assert_eq!(cpu.csrs[MEPC], DRAM_BASE + 8, "will resume at the third nop");
+    }
+
+    #[test]
+    fn the_msip_doorbell_raises_a_software_interrupt() {
+        let mut cpu = cpu_with_program(&[0x00000013]);
+        cpu.bus.store32(CLINT_BASE, 1).unwrap(); // ring the doorbell
+        cpu.csrs[MIE_CSR] = 1 << 3;
+        cpu.csrs[MSTATUS] |= 1 << 3;
+        cpu.csrs[MTVEC] = DRAM_BASE + 0x40;
+        cpu.bus.store32(DRAM_BASE + 0x40, 0x00000013).unwrap();
+        cpu.step().unwrap();
+        assert_eq!(cpu.csrs[MCAUSE], (1 << 63) | 3, "software interrupt taken");
+        // Acknowledging = clearing the doorbell; the wire drops on the
+        // next tick and the pending bit follows.
+        cpu.bus.store32(CLINT_BASE, 0).unwrap();
+        cpu.tick();
+        assert_eq!(cpu.csrs[MIP_CSR] & (1 << 3), 0, "MSIP followed the wire");
     }
 
     #[test]
