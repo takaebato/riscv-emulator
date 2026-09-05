@@ -714,9 +714,39 @@ fn imm_j(raw: u32) -> i64 {
 pub fn decode_compressed(parcel: u16) -> Result<Inst, Exception> {
     let op = parcel & 0b11;
     let funct3 = parcel >> 13;
-    // The full-width register field (bits 11:7), used by quadrant 1/2 forms.
+    // Full-width register fields: rd/rs1 at [11:7], rs2 at [6:2]. The
+    // primed (') 3-bit fields at [9:7]/[4:2] address only x8-x15 — the
+    // eight registers compilers use most, per the C extension's statistics.
     let rd_full = ((parcel >> 7) & 0x1f) as usize;
+    let rs2_full = ((parcel >> 2) & 0x1f) as usize;
+    let rs1_c = 8 + ((parcel >> 7) & 0b111) as usize;
+    let rd_c = 8 + ((parcel >> 2) & 0b111) as usize; // doubles as rs2'
+    let illegal = Err(Exception::IllegalInstruction(parcel as u32));
     match (op, funct3) {
+        // --- Quadrant 0: memory access through the primed registers ---
+        //
+        // C.ADDI4SPN: addi rd', sp, nzuimm — materialize the address of a
+        // stack slot. nzuimm = 0 makes the all-zero parcel land here, and
+        // the spec defines it illegal on purpose: jumping into zeroed
+        // memory should trap, not silently no-op.
+        (0b00, 0b000) => {
+            let uimm = imm_ciw(parcel);
+            if uimm == 0 {
+                return illegal;
+            }
+            Ok(Inst::Addi { rd: rd_c, rs1: 2, imm: uimm })
+        }
+        // C.LW/C.LD and C.SW/C.SD: the workhorse field accesses. The
+        // offset is unsigned and scaled (fields are multiples of the
+        // access size — no bits wasted encoding misalignment).
+        (0b00, 0b010) => Ok(Inst::Lw { rd: rd_c, rs1: rs1_c, offset: imm_c_mem_w(parcel) }),
+        (0b00, 0b011) => Ok(Inst::Ld { rd: rd_c, rs1: rs1_c, offset: imm_c_mem_d(parcel) }),
+        (0b00, 0b110) => Ok(Inst::Sw { rs1: rs1_c, rs2: rd_c, offset: imm_c_mem_w(parcel) }),
+        (0b00, 0b111) => Ok(Inst::Sd { rs1: rs1_c, rs2: rd_c, offset: imm_c_mem_d(parcel) }),
+        // (001/101 are C.FLD/C.FSD: illegal until the D extension.)
+
+        // --- Quadrant 1 (in progress) ---
+        //
         // C.ADDI: addi rd, rd, imm6. rd=0 imm=0 is the canonical C.NOP;
         // other rd=0 forms are HINTs, which execute fine as addi x0.
         (0b01, 0b000) => Ok(Inst::Addi {
@@ -724,7 +754,41 @@ pub fn decode_compressed(parcel: u16) -> Result<Inst, Exception> {
             rs1: rd_full,
             imm: imm_ci(parcel),
         }),
-        _ => Err(Exception::IllegalInstruction(parcel as u32)),
+
+        // --- Quadrant 2: stack-pointer-relative + full-register ops ---
+        //
+        // C.SLLI: slli rd, rd, shamt (6-bit shamt like the full form).
+        (0b10, 0b000) => Ok(Inst::Slli { rd: rd_full, rs1: rd_full, shamt: shamt_ci(parcel) }),
+        // C.LWSP/C.LDSP: load from the stack frame; rd = x0 is reserved.
+        (0b10, 0b010) if rd_full != 0 => {
+            Ok(Inst::Lw { rd: rd_full, rs1: 2, offset: imm_lwsp(parcel) })
+        }
+        (0b10, 0b011) if rd_full != 0 => {
+            Ok(Inst::Ld { rd: rd_full, rs1: 2, offset: imm_ldsp(parcel) })
+        }
+        // funct3=100 packs five instructions, split by bit 12 and the
+        // zero-ness of the register fields.
+        (0b10, 0b100) => {
+            let bit12 = (parcel >> 12) & 1;
+            match (bit12, rd_full, rs2_full) {
+                // C.JR: jalr x0, 0(rs1) — `ret` is c.jr x1. rs1=0 reserved.
+                (0, rs1, 0) if rs1 != 0 => Ok(Inst::Jalr { rd: 0, rs1, offset: 0 }),
+                (0, 0, 0) => illegal,
+                // C.MV: add rd, x0, rs2 (a copy through the adder).
+                (0, rd, rs2) => Ok(Inst::Add { rd, rs1: 0, rs2 }),
+                // C.EBREAK: the 16-bit breakpoint (debuggers need it to
+                // patch compressed code without growing it).
+                (1, 0, 0) => Ok(Inst::Ebreak),
+                // C.JALR: jalr x1, 0(rs1) — links pc+2 via execute's len.
+                (1, rs1, 0) => Ok(Inst::Jalr { rd: 1, rs1, offset: 0 }),
+                // C.ADD: add rd, rd, rs2.
+                (_, rd, rs2) => Ok(Inst::Add { rd, rs1: rd, rs2 }),
+            }
+        }
+        // C.SWSP/C.SDSP: store to the stack frame.
+        (0b10, 0b110) => Ok(Inst::Sw { rs1: 2, rs2: rs2_full, offset: imm_swsp(parcel) }),
+        (0b10, 0b111) => Ok(Inst::Sd { rs1: 2, rs2: rs2_full, offset: imm_sdsp(parcel) }),
+        _ => illegal,
     }
 }
 
@@ -733,6 +797,61 @@ pub fn decode_compressed(parcel: u16) -> Result<Inst, Exception> {
 fn imm_ci(parcel: u16) -> i64 {
     let imm = ((((parcel >> 12) & 0x1) << 5) | ((parcel >> 2) & 0x1f)) as u64;
     ((imm << 58) as i64) >> 58
+}
+
+// The compressed memory offsets are unsigned (stack slots and struct
+// fields sit at positive offsets) and scaled to the access size, so no
+// bit encodes anything below the alignment. Each format scatters its
+// bits differently — the price of squeezing fields into 16 bits.
+
+/// CIW (C.ADDI4SPN): [12:11]=uimm[5:4], [10:7]=uimm[9:6], [6]=uimm[2], [5]=uimm[3].
+fn imm_ciw(parcel: u16) -> i64 {
+    let p = parcel as u64;
+    ((((p >> 11) & 0x3) << 4)
+        | (((p >> 7) & 0xf) << 6)
+        | (((p >> 6) & 0x1) << 2)
+        | (((p >> 5) & 0x1) << 3)) as i64
+}
+
+/// CL/CS word offset (C.LW/C.SW): [12:10]=uimm[5:3], [6]=uimm[2], [5]=uimm[6].
+fn imm_c_mem_w(parcel: u16) -> i64 {
+    let p = parcel as u64;
+    ((((p >> 10) & 0x7) << 3) | (((p >> 6) & 0x1) << 2) | (((p >> 5) & 0x1) << 6)) as i64
+}
+
+/// CL/CS doubleword offset (C.LD/C.SD): [12:10]=uimm[5:3], [6:5]=uimm[7:6].
+fn imm_c_mem_d(parcel: u16) -> i64 {
+    let p = parcel as u64;
+    ((((p >> 10) & 0x7) << 3) | (((p >> 5) & 0x3) << 6)) as i64
+}
+
+/// C.LWSP offset: [12]=uimm[5], [6:4]=uimm[4:2], [3:2]=uimm[7:6].
+fn imm_lwsp(parcel: u16) -> i64 {
+    let p = parcel as u64;
+    ((((p >> 12) & 0x1) << 5) | (((p >> 4) & 0x7) << 2) | (((p >> 2) & 0x3) << 6)) as i64
+}
+
+/// C.LDSP offset: [12]=uimm[5], [6:5]=uimm[4:3], [4:2]=uimm[8:6].
+fn imm_ldsp(parcel: u16) -> i64 {
+    let p = parcel as u64;
+    ((((p >> 12) & 0x1) << 5) | (((p >> 5) & 0x3) << 3) | (((p >> 2) & 0x7) << 6)) as i64
+}
+
+/// C.SWSP offset: [12:9]=uimm[5:2], [8:7]=uimm[7:6].
+fn imm_swsp(parcel: u16) -> i64 {
+    let p = parcel as u64;
+    ((((p >> 9) & 0xf) << 2) | (((p >> 7) & 0x3) << 6)) as i64
+}
+
+/// C.SDSP offset: [12:10]=uimm[5:3], [9:7]=uimm[8:6].
+fn imm_sdsp(parcel: u16) -> i64 {
+    let p = parcel as u64;
+    ((((p >> 10) & 0x7) << 3) | (((p >> 7) & 0x7) << 6)) as i64
+}
+
+/// CI shift amount (C.SLLI/C.SRLI/C.SRAI): [12]=shamt[5], [6:2]=shamt[4:0].
+fn shamt_ci(parcel: u16) -> u32 {
+    ((((parcel >> 12) & 0x1) << 5) | ((parcel >> 2) & 0x1f)) as u32
 }
 
 #[cfg(test)]
@@ -1288,6 +1407,123 @@ mod tests {
         assert!(decode(0xf1402573).is_ok());
     }
 
+    /// The compressed sibling of decode_checked: the binary shows the
+    /// field split, the hex is the word binutils assembled.
+    fn decode_compressed_checked(binary: u16, hex: u16) -> Result<Inst, Exception> {
+        assert_eq!(binary, hex, "field split does not match the assembled word");
+        decode_compressed(binary)
+    }
+
+    #[test]
+    fn decodes_compressed_quadrant0() {
+        // CIW: funct3_uimm[5:4]_uimm[9:6]_uimm[2]_uimm[3]_rd'_op
+        // c.addi4spn a0, sp, 40 (all hex words in this test assembled by
+        // riscv64-elf-gcc from the c.* mnemonics)
+        assert_eq!(
+            decode_compressed_checked(0b000_10_0000_0_1_010_00, 0x1028).unwrap(),
+            Inst::Addi { rd: 10, rs1: 2, imm: 40 }
+        );
+        // The all-zero parcel is nzuimm=0 here and defined illegal:
+        // jumping into zeroed memory must trap.
+        assert_eq!(decode_compressed(0x0000), Err(Exception::IllegalInstruction(0)));
+        // CL: funct3_uimm[5:3]_rs1'_uimm[2]_uimm[6]_rd'_op
+        // c.lw a1, 4(a0)
+        assert_eq!(
+            decode_compressed_checked(0b010_000_010_1_0_011_00, 0x414c).unwrap(),
+            Inst::Lw { rd: 11, rs1: 10, offset: 4 }
+        );
+        // CL doubleword: funct3_uimm[5:3]_rs1'_uimm[7:6]_rd'_op
+        // c.ld a2, 8(a0)
+        assert_eq!(
+            decode_compressed_checked(0b011_001_010_00_100_00, 0x6510).unwrap(),
+            Inst::Ld { rd: 12, rs1: 10, offset: 8 }
+        );
+        // CS: same layouts with rd' read as rs2'
+        // c.sw a1, 12(a0)
+        assert_eq!(
+            decode_compressed_checked(0b110_001_010_1_0_011_00, 0xc54c).unwrap(),
+            Inst::Sw { rs1: 10, rs2: 11, offset: 12 }
+        );
+        // c.sd a2, 16(a0)
+        assert_eq!(
+            decode_compressed_checked(0b111_010_010_00_100_00, 0xe910).unwrap(),
+            Inst::Sd { rs1: 10, rs2: 12, offset: 16 }
+        );
+    }
+
+    #[test]
+    fn decodes_compressed_quadrant2() {
+        // CI: funct3_shamt[5]_rd_shamt[4:0]_op
+        // c.slli a0, 3
+        assert_eq!(
+            decode_compressed_checked(0b000_0_01010_00011_10, 0x050e).unwrap(),
+            Inst::Slli { rd: 10, rs1: 10, shamt: 3 }
+        );
+        // c.lwsp a1, 8(sp): funct3_uimm[5]_rd_uimm[4:2]_uimm[7:6]_op
+        assert_eq!(
+            decode_compressed_checked(0b010_0_01011_010_00_10, 0x45a2).unwrap(),
+            Inst::Lw { rd: 11, rs1: 2, offset: 8 }
+        );
+        // c.ldsp a2, 16(sp): funct3_uimm[5]_rd_uimm[4:3]_uimm[8:6]_op
+        assert_eq!(
+            decode_compressed_checked(0b011_0_01100_10_000_10, 0x6642).unwrap(),
+            Inst::Ld { rd: 12, rs1: 2, offset: 16 }
+        );
+        // c.lwsp to x0 is reserved
+        assert_eq!(
+            decode_compressed_checked(0b010_0_00000_010_00_10, 0x4022),
+            Err(Exception::IllegalInstruction(0x4022))
+        );
+        // CSS: funct3_uimm[5:2]_uimm[7:6]_rs2_op
+        // c.swsp a1, 24(sp)
+        assert_eq!(
+            decode_compressed_checked(0b110_0110_00_01011_10, 0xcc2e).unwrap(),
+            Inst::Sw { rs1: 2, rs2: 11, offset: 24 }
+        );
+        // c.sdsp a2, 32(sp): funct3_uimm[5:3]_uimm[8:6]_rs2_op
+        assert_eq!(
+            decode_compressed_checked(0b111_100_000_01100_10, 0xf032).unwrap(),
+            Inst::Sd { rs1: 2, rs2: 12, offset: 32 }
+        );
+    }
+
+    #[test]
+    fn decodes_compressed_jumps_and_register_ops() {
+        // funct3=100 of quadrant 2: bit 12 and the zero-ness of the two
+        // register fields split it five ways.
+        // CR: funct3_bit12_rs1/rd_rs2_op
+        // c.jr a0 = jalr x0, 0(a0)
+        assert_eq!(
+            decode_compressed_checked(0b100_0_01010_00000_10, 0x8502).unwrap(),
+            Inst::Jalr { rd: 0, rs1: 10, offset: 0 }
+        );
+        // c.jalr a0 = jalr x1, 0(a0) — the link is pc+2, handled by len
+        assert_eq!(
+            decode_compressed_checked(0b100_1_01010_00000_10, 0x9502).unwrap(),
+            Inst::Jalr { rd: 1, rs1: 10, offset: 0 }
+        );
+        // c.mv a1, a2 = add a1, x0, a2
+        assert_eq!(
+            decode_compressed_checked(0b100_0_01011_01100_10, 0x85b2).unwrap(),
+            Inst::Add { rd: 11, rs1: 0, rs2: 12 }
+        );
+        // c.add a1, a2 = add a1, a1, a2
+        assert_eq!(
+            decode_compressed_checked(0b100_1_01011_01100_10, 0x95b2).unwrap(),
+            Inst::Add { rd: 11, rs1: 11, rs2: 12 }
+        );
+        // c.ebreak
+        assert_eq!(
+            decode_compressed_checked(0b100_1_00000_00000_10, 0x9002).unwrap(),
+            Inst::Ebreak
+        );
+        // c.jr x0 is reserved
+        assert_eq!(
+            decode_compressed_checked(0b100_0_00000_00000_10, 0x8002),
+            Err(Exception::IllegalInstruction(0x8002))
+        );
+    }
+
     #[test]
     fn decodes_compressed_addi() {
         // CI format: funct3_imm[5]_rd_imm[4:0]_op
@@ -1301,10 +1537,10 @@ mod tests {
             decode_compressed(0b000_1_01010_11101_01).unwrap(),
             Inst::Addi { rd: 10, rs1: 10, imm: -3 }
         );
-        // Quadrants not yet populated stay illegal (this is c.lw's slot).
+        // c.fld's slot stays illegal until the D extension arrives.
         assert_eq!(
-            decode_compressed(0b010_0_00000_00000_00),
-            Err(Exception::IllegalInstruction(0b010_0_00000_00000_00))
+            decode_compressed(0b001_0_00000_00000_00),
+            Err(Exception::IllegalInstruction(0b001_0_00000_00000_00))
         );
     }
 
