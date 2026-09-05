@@ -42,8 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => Some(e),
         };
         if let Some(e) = stop {
-            println!("\nstopped at {pc:#010x}: {e}");
-            break;
+            // Architectural behavior: exceptions trap into the guest's
+            // handler (mtvec) and the run continues.
+            println!("{pc:#010x}: --------  [trap: {e}]");
+            cpu.trap(&e);
         }
         executed += 1;
         if let Some(outcome) = harness::check_tohost(&cpu, tohost) {

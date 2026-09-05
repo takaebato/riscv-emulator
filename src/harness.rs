@@ -10,7 +10,6 @@
 //! bare-metal `-p` tests only ever use the exit code, so that is all we read.)
 
 use crate::cpu::Cpu;
-use crate::exception::Exception;
 
 /// How a test run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,11 +18,8 @@ pub enum Outcome {
     Pass,
     /// tohost = (testnum << 1) | 1: `testnum` is the failing test case.
     Fail { testnum: u64 },
-    /// The emulator gave up: an exception surfaced out of step(), i.e. the
-    /// guest hit something we have not implemented (or a real bug). `pc` is
-    /// the offending instruction (step() leaves pc uncommitted on error).
-    Exception { pc: u64, e: Exception },
-    /// The step budget ran out before tohost was written (livelock guard).
+    /// The step budget ran out before tohost was written (livelock guard,
+    /// which also catches a guest spinning through an unhandled trap).
     StepLimit,
 }
 
@@ -32,7 +28,6 @@ impl std::fmt::Display for Outcome {
         match self {
             Outcome::Pass => write!(f, "PASS"),
             Outcome::Fail { testnum } => write!(f, "FAIL (test case {testnum})"),
-            Outcome::Exception { pc, e } => write!(f, "exception at {pc:#x}: {e}"),
             Outcome::StepLimit => write!(f, "step limit exhausted before tohost was written"),
         }
     }
@@ -48,12 +43,16 @@ pub fn check_tohost(cpu: &Cpu, tohost: u64) -> Option<Outcome> {
     }
 }
 
-/// Run the interpreter loop until the test reports through tohost, an
-/// exception escapes, or `step_limit` steps elapse.
+/// Run the interpreter loop until the test reports through tohost or
+/// `step_limit` steps elapse.
 pub fn run(cpu: &mut Cpu, tohost: u64, step_limit: u64) -> Outcome {
     for _ in 0..step_limit {
         if let Err(e) = cpu.step() {
-            return Outcome::Exception { pc: cpu.pc, e };
+            // Hardware never "stops on an error": every exception becomes
+            // an architectural trap into the guest's handler. The tests
+            // rely on it (probing optional CSRs under a prepared mtvec),
+            // and an unhandled trap just spins into StepLimit.
+            cpu.trap(&e);
         }
         if let Some(outcome) = check_tohost(cpu, tohost) {
             return outcome;
@@ -106,16 +105,35 @@ mod tests {
     }
 
     #[test]
-    fn escaped_exception_reports_the_pc() {
-        // 0x00000000 does not decode; the harness reports instead of panicking.
+    fn exceptions_trap_into_the_guest_handler() {
+        // An illegal word (all zeros) with mtvec aimed at a handler that
+        // reports failure through tohost: the harness must trap and keep
+        // going, like hardware, not stop and report an emulator error.
         let mut cpu = cpu_with_program(&[0x00000000]);
-        assert_eq!(
-            run(&mut cpu, TOHOST, 10),
-            Outcome::Exception {
-                pc: DRAM_BASE,
-                e: Exception::IllegalInstruction(0),
-            }
-        );
+        let handler = DRAM_BASE + 0x40;
+        cpu.csrs[0x305] = handler; // mtvec
+        // Handler, reporting 3 = (1 << 1) | 1 to tohost. Like tohost_writer
+        // but pc-relative from the handler: auipc x2, 0 lands at +0x40, so
+        // the store reaches TOHOST at 0xc0(x2).
+        let words = [
+            0x00000117, // auipc x2, 0      -> x2 = handler
+            0x00300093, // addi  x1, x0, 3
+            0x0c113023, // sd    x1, 0xc0(x2)
+            0x0000006f, // jal   x0, 0      (spin)
+        ];
+        for (i, w) in words.iter().enumerate() {
+            cpu.bus.store32(handler + 4 * i as u64, *w).unwrap();
+        }
+        assert_eq!(run(&mut cpu, TOHOST, 10), Outcome::Fail { testnum: 1 });
+        assert_eq!(cpu.csrs[0x342], 2, "mcause: illegal instruction");
+    }
+
+    #[test]
+    fn an_unhandled_trap_spins_to_the_step_limit() {
+        // mtvec = 0 (outside DRAM): the trap loop can never make progress,
+        // and the step limit is the net that catches it.
+        let mut cpu = cpu_with_program(&[0x00000000]);
+        assert_eq!(run(&mut cpu, TOHOST, 10), Outcome::StepLimit);
     }
 
     #[test]

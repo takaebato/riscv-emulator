@@ -629,7 +629,7 @@ pub fn decode(raw: u32) -> Result<Inst, Exception> {
             // is dynamic and will move to execute in phase 3.
             let read_only = csr >> 10 == 0b11;
             let check = |writes: bool, inst: Inst| {
-                if writes && read_only {
+                if !csr_exists(csr) || (writes && read_only) {
                     Err(Exception::IllegalInstruction(raw))
                 } else {
                     Ok(inst)
@@ -700,6 +700,31 @@ fn imm_j(raw: u32) -> i64 {
     let imm = (imm20 << 20) | (imm19_12 << 12) | (imm11 << 11) | (imm10_1 << 1);
     // Sign-extend from bit 20 (shift the sign bit up to bit 63, then back down).
     ((imm << 43) as i64) >> 43
+}
+
+/// The CSRs this machine implements. Accessing any other address raises
+/// illegal-instruction, exactly like real hardware missing an extension:
+/// the riscv-tests startup relies on this to probe optional features
+/// (it pokes mnstatus with mtvec aimed at the next instruction and lets
+/// the trap skip over it). Existence is static per address, so the check
+/// lives in decode; the privilege check (phase 3) will be dynamic.
+///
+/// The list = what phase 3's machine mode will model, plus the stubs the
+/// test environment initializes (satp, PMP). Whitelisted CSRs keep plain
+/// storage semantics for now (read back what was written); hardwired
+/// field behavior (WARL masks, mstatus bits) arrives with phase 3.
+fn csr_exists(csr: usize) -> bool {
+    matches!(csr,
+        // machine information (read-only): mvendorid, marchid, mimpid, mhartid
+        0xf11..=0xf14
+        // machine trap setup: mstatus, misa, medeleg, mideleg, mie, mtvec, mcounteren
+        | 0x300..=0x306
+        // machine trap handling: mscratch, mepc, mcause, mtval, mip
+        | 0x340..=0x344
+        // supervisor address translation (written to 0 by the test env)
+        | 0x180
+        // physical memory protection: pmpcfg0-14 (even), pmpaddr0-63
+        | 0x3a0..=0x3af | 0x3b0..=0x3ef)
 }
 
 /// Decode a 16-bit compressed parcel (C extension) into the same Inst its
@@ -1483,6 +1508,23 @@ mod tests {
         assert_eq!(
             decode_checked(0b0001000_00101_00000_000_00000_1110011, 0x10500073),
             Err(Exception::IllegalInstruction(0x10500073))
+        );
+    }
+
+    #[test]
+    fn rejects_unimplemented_csr() {
+        // csrwi mnstatus, 8 (0x744, Smrnmi) — the riscv-tests startup pokes
+        // it expecting exactly this illegal-instruction, with mtvec aimed
+        // at the next instruction. Spike traps here too.
+        assert_eq!(
+            decode_checked(0b011101000100_01000_101_00000_1110011, 0x74445073),
+            Err(Exception::IllegalInstruction(0x74445073))
+        );
+        // Reads of nonexistent CSRs are equally illegal (existence is not
+        // write-gated): csrr t0, mnstatus.
+        assert_eq!(
+            decode_checked(0b011101000100_00000_010_00101_1110011, 0x744022f3),
+            Err(Exception::IllegalInstruction(0x744022f3))
         );
     }
 
