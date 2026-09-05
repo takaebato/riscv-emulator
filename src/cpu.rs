@@ -15,6 +15,12 @@ const MTVEC: usize = 0x305;
 /// CSR address of mepc (Machine Exception Program Counter): where a trap saves
 /// the interrupted pc, and where MRET returns to.
 const MEPC: usize = 0x341;
+/// CSR address of mie (Machine Interrupt Enable): which interrupt sources
+/// may fire (a mask over the same bit layout as mip).
+const MIE_CSR: usize = 0x304;
+/// CSR address of mip (Machine Interrupt Pending): which sources are
+/// currently requesting attention. Devices raise these bits.
+const MIP_CSR: usize = 0x344;
 /// CSR address of mcause: why the last trap was taken.
 const MCAUSE: usize = 0x342;
 /// CSR address of mtval (Machine Trap VALue): extra evidence about the trap
@@ -123,8 +129,11 @@ impl Cpu {
         Ok((inst, len, raw))
     }
 
-    /// One turn of the interpreter loop: fetch → decode → execute.
+    /// One turn of the interpreter loop: take a pending interrupt if any,
+    /// then fetch → decode → execute (an interrupt redirects pc first, so
+    /// the instruction executed is the handler's).
     pub fn step(&mut self) -> Result<(), Exception> {
+        self.take_pending_interrupt();
         let (inst, len, _) = self.fetch_decode()?;
         self.execute(inst, len)
     }
@@ -157,6 +166,58 @@ impl Cpu {
         }
     }
 
+    /// The mstatus half of entering a trap, shared by exceptions and
+    /// interrupts: stash the interrupt enable in MPIE and clear it
+    /// (handlers start with interrupts off), record the interrupted
+    /// privilege in MPP, rise to M.
+    fn push_trap_mstatus(&mut self) {
+        let mstatus = self.csrs[MSTATUS];
+        let mie = (mstatus >> 3) & 1;
+        let mut v = mstatus;
+        v = (v & !(1 << 7)) | (mie << 7); // MPIE = MIE
+        v &= !(1 << 3); // MIE = 0
+        v = (v & !(0b11 << 11)) | ((self.privilege as u64) << 11); // MPP
+        self.csrs[MSTATUS] = v;
+        self.privilege = PrivilegeMode::Machine;
+    }
+
+    /// If an enabled interrupt is pending, take it: like an exception trap,
+    /// except mepc points at the instruction that has *not* executed yet,
+    /// mcause carries bit 63, and vectored mtvec dispatches interrupts to
+    /// base + 4×cause. Returns whether one was taken. Called between
+    /// instructions — the only place the architecture lets them fire.
+    pub fn take_pending_interrupt(&mut self) -> bool {
+        // M-mode interrupts fire when running below M (they preempt U
+        // unconditionally), or in M itself only if mstatus.MIE agrees.
+        let enabled = self.privilege != PrivilegeMode::Machine
+            || (self.csrs[MSTATUS] >> 3) & 1 == 1;
+        if !enabled {
+            return false;
+        }
+        let pending = self.csrs[MIE_CSR] & self.csrs[MIP_CSR];
+        // Priority per spec: external (11), then software (3), then timer (7).
+        let code = if pending & (1 << 11) != 0 {
+            11
+        } else if pending & (1 << 3) != 0 {
+            3
+        } else if pending & (1 << 7) != 0 {
+            7
+        } else {
+            return false;
+        };
+        self.csrs[MEPC] = self.pc; // the interrupted (not yet run) instruction
+        self.csrs[MCAUSE] = (1 << 63) | code;
+        self.csrs[MTVAL] = 0;
+        self.push_trap_mstatus();
+        let mtvec = self.csrs[MTVEC];
+        self.pc = if mtvec & 0b11 == 1 {
+            (mtvec & !0b11) + 4 * code // vectored: per-cause entry points
+        } else {
+            mtvec & !0b11
+        };
+        true
+    }
+
     /// Take a trap: record what happened in the CSRs and redirect pc to the
     /// handler. `self.pc` must still point at the instruction that trapped
     /// (execute guarantees this: pc is only committed on success).
@@ -169,17 +230,7 @@ impl Cpu {
             Exception::Breakpoint => self.pc,
             _ => e.tval(),
         };
-        // The mstatus stack pushes: the interrupt enable is stashed in MPIE
-        // and cleared (handlers start with interrupts off), the interrupted
-        // privilege is recorded in MPP, and the hart rises to M.
-        let mstatus = self.csrs[MSTATUS];
-        let mie = (mstatus >> 3) & 1;
-        let mut v = mstatus;
-        v = (v & !(1 << 7)) | (mie << 7); // MPIE = MIE
-        v &= !(1 << 3); // MIE = 0
-        v = (v & !(0b11 << 11)) | ((self.privilege as u64) << 11); // MPP = interrupted mode
-        self.csrs[MSTATUS] = v;
-        self.privilege = PrivilegeMode::Machine;
+        self.push_trap_mstatus();
         // The low 2 bits of mtvec select direct vs vectored mode. Vectored
         // only affects interrupts (pc = base + 4 * cause); exceptions always
         // enter at base, so masking the mode bits off is correct here.
@@ -1271,6 +1322,72 @@ mod tests {
         let mut cpu = cpu_with_program(&[0x30001073]);
         cpu.step().unwrap();
         assert_eq!((cpu.csrs[MSTATUS] >> 32) & 0b11, 2, "UXL hardwired to 64-bit");
+    }
+
+    #[test]
+    fn timer_interrupt_preempts_between_instructions() {
+        // MTIP pending + MTIE enabled + mstatus.MIE: the addi never runs;
+        // the step enters the handler instead, mepc naming the preempted
+        // instruction and mcause carrying the interrupt bit.
+        let mut cpu = cpu_with_program(&[0x00100093]); // addi x1, x0, 1
+        cpu.csrs[MIP_CSR] = 1 << 7;
+        cpu.csrs[MIE_CSR] = 1 << 7;
+        cpu.csrs[MSTATUS] |= 1 << 3;
+        cpu.csrs[MTVEC] = DRAM_BASE + 0x40;
+        cpu.bus.store32(DRAM_BASE + 0x40, 0x00200093).unwrap(); // addi x1, x0, 2
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], 2, "the handler's instruction ran, not the addi");
+        assert_eq!(cpu.csrs[MEPC], DRAM_BASE, "mepc: the instruction never run");
+        assert_eq!(cpu.csrs[MCAUSE], (1 << 63) | 7, "interrupt bit + timer code");
+    }
+
+    #[test]
+    fn interrupts_wait_while_mie_is_clear() {
+        // Same pending state but mstatus.MIE off in M-mode: the interrupt
+        // stays pending and the instruction runs normally.
+        let mut cpu = cpu_with_program(&[0x00100093]);
+        cpu.csrs[MIP_CSR] = 1 << 7;
+        cpu.csrs[MIE_CSR] = 1 << 7;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], 1);
+        assert_eq!(cpu.csrs[MIP_CSR], 1 << 7, "still pending, not lost");
+    }
+
+    #[test]
+    fn vectored_mtvec_splits_interrupts_from_exceptions() {
+        // mtvec mode bits = 01 (vectored): interrupts enter base + 4*cause,
+        // but exceptions still enter at base.
+        let base = DRAM_BASE + 0x40;
+        let mut cpu = cpu_with_program(&[0x00100093]);
+        cpu.csrs[MIP_CSR] = 1 << 7;
+        cpu.csrs[MIE_CSR] = 1 << 7;
+        cpu.csrs[MSTATUS] |= 1 << 3;
+        cpu.csrs[MTVEC] = base | 1;
+        cpu.bus.store32(base + 4 * 7, 0x00300093).unwrap(); // timer slot
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], 3, "entered the timer's vector slot");
+        // An ecall under the same vectored mtvec enters at base.
+        let mut cpu = cpu_with_program(&[0x00000073]);
+        cpu.csrs[MTVEC] = base | 1;
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, base, "exceptions ignore vectoring");
+    }
+
+    #[test]
+    fn machine_interrupts_preempt_user_mode_unconditionally() {
+        // Drop to U with mstatus.MIE clear: M-mode interrupts fire anyway
+        // (MIE only gates interrupts while running in M itself).
+        let mut cpu = cpu_with_program(&[0x30200073, 0x00100093]); // mret; addi
+        cpu.csrs[MEPC] = DRAM_BASE + 4;
+        cpu.csrs[MTVEC] = DRAM_BASE + 0x40;
+        cpu.bus.store32(DRAM_BASE + 0x40, 0x00200093).unwrap();
+        cpu.step().unwrap(); // mret -> U (and MIE stays 0)
+        cpu.csrs[MIP_CSR] = 1 << 7;
+        cpu.csrs[MIE_CSR] = 1 << 7;
+        cpu.step().unwrap();
+        assert_eq!(cpu.regs[1], 2, "preempted despite MIE = 0");
+        assert_eq!((cpu.csrs[MSTATUS] >> 11) & 0b11, 0, "MPP recorded U");
+        assert_eq!(cpu.privilege, PrivilegeMode::Machine);
     }
 
     #[test]
