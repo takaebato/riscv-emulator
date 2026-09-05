@@ -745,7 +745,7 @@ pub fn decode_compressed(parcel: u16) -> Result<Inst, Exception> {
         (0b00, 0b111) => Ok(Inst::Sd { rs1: rs1_c, rs2: rd_c, offset: imm_c_mem_d(parcel) }),
         // (001/101 are C.FLD/C.FSD: illegal until the D extension.)
 
-        // --- Quadrant 1 (in progress) ---
+        // --- Quadrant 1: immediates, arithmetic, and control flow ---
         //
         // C.ADDI: addi rd, rd, imm6. rd=0 imm=0 is the canonical C.NOP;
         // other rd=0 forms are HINTs, which execute fine as addi x0.
@@ -754,6 +754,58 @@ pub fn decode_compressed(parcel: u16) -> Result<Inst, Exception> {
             rs1: rd_full,
             imm: imm_ci(parcel),
         }),
+        // C.ADDIW (RV64): rd = 0 is reserved (RV32 uses this slot for C.JAL).
+        (0b01, 0b001) if rd_full != 0 => Ok(Inst::Addiw {
+            rd: rd_full,
+            rs1: rd_full,
+            imm: imm_ci(parcel),
+        }),
+        // C.LI: addi rd, x0, imm6 — load a small constant.
+        (0b01, 0b010) => Ok(Inst::Addi { rd: rd_full, rs1: 0, imm: imm_ci(parcel) }),
+        // funct3=011 splits on rd: x2 means C.ADDI16SP (grow/shrink the
+        // stack frame, imm scaled by 16), anything else C.LUI (imm6
+        // placed at bits 17:12). Both reserve the all-zero immediate.
+        (0b01, 0b011) => {
+            if rd_full == 2 {
+                let imm = imm_addi16sp(parcel);
+                if imm == 0 {
+                    return illegal;
+                }
+                Ok(Inst::Addi { rd: 2, rs1: 2, imm })
+            } else {
+                let imm = imm_ci(parcel);
+                if imm == 0 {
+                    return illegal;
+                }
+                Ok(Inst::Lui { rd: rd_full, imm: imm << 12 })
+            }
+        }
+        // funct3=100: the arithmetic block on primed registers, split by
+        // bits 11:10 and, for register-register forms, bit 12 + bits 6:5.
+        (0b01, 0b100) => {
+            let rd = rs1_c; // rd' sits in the rs1' position here
+            let rs2 = rd_c;
+            match (parcel >> 10) & 0b11 {
+                0b00 => Ok(Inst::Srli { rd, rs1: rd, shamt: shamt_ci(parcel) }),
+                0b01 => Ok(Inst::Srai { rd, rs1: rd, shamt: shamt_ci(parcel) }),
+                0b10 => Ok(Inst::Andi { rd, rs1: rd, imm: imm_ci(parcel) }),
+                _ => match ((parcel >> 12) & 1, (parcel >> 5) & 0b11) {
+                    (0, 0b00) => Ok(Inst::Sub { rd, rs1: rd, rs2 }),
+                    (0, 0b01) => Ok(Inst::Xor { rd, rs1: rd, rs2 }),
+                    (0, 0b10) => Ok(Inst::Or { rd, rs1: rd, rs2 }),
+                    (0, 0b11) => Ok(Inst::And { rd, rs1: rd, rs2 }),
+                    (1, 0b00) => Ok(Inst::Subw { rd, rs1: rd, rs2 }),
+                    (1, 0b01) => Ok(Inst::Addw { rd, rs1: rd, rs2 }),
+                    _ => illegal,
+                },
+            }
+        }
+        // C.J: jal x0 — the compressed unconditional jump (±2 KiB).
+        (0b01, 0b101) => Ok(Inst::Jal { rd: 0, offset: imm_cj(parcel) }),
+        // C.BEQZ/C.BNEZ: compare against x0 only — the most common
+        // branch by far, per the statistics C is built on (±256 B).
+        (0b01, 0b110) => Ok(Inst::Beq { rs1: rs1_c, rs2: 0, offset: imm_cb(parcel) }),
+        (0b01, 0b111) => Ok(Inst::Bne { rs1: rs1_c, rs2: 0, offset: imm_cb(parcel) }),
 
         // --- Quadrant 2: stack-pointer-relative + full-register ops ---
         //
@@ -852,6 +904,46 @@ fn imm_sdsp(parcel: u16) -> i64 {
 /// CI shift amount (C.SLLI/C.SRLI/C.SRAI): [12]=shamt[5], [6:2]=shamt[4:0].
 fn shamt_ci(parcel: u16) -> u32 {
     ((((parcel >> 12) & 0x1) << 5) | ((parcel >> 2) & 0x1f)) as u32
+}
+
+/// C.ADDI16SP immediate, scaled by 16: [12]=imm[9] (sign), [6]=imm[4],
+/// [5]=imm[6], [4:3]=imm[8:7], [2]=imm[5].
+fn imm_addi16sp(parcel: u16) -> i64 {
+    let p = parcel as u64;
+    let imm = (((p >> 12) & 0x1) << 9)
+        | (((p >> 6) & 0x1) << 4)
+        | (((p >> 5) & 0x1) << 6)
+        | (((p >> 3) & 0x3) << 7)
+        | (((p >> 2) & 0x1) << 5);
+    ((imm << 54) as i64) >> 54
+}
+
+/// CJ offset (C.J), the most scattered of them all: [12]=imm[11] (sign),
+/// [11]=imm[4], [10:9]=imm[9:8], [8]=imm[10], [7]=imm[6], [6]=imm[7],
+/// [5:3]=imm[3:1], [2]=imm[5].
+fn imm_cj(parcel: u16) -> i64 {
+    let p = parcel as u64;
+    let imm = (((p >> 12) & 0x1) << 11)
+        | (((p >> 11) & 0x1) << 4)
+        | (((p >> 9) & 0x3) << 8)
+        | (((p >> 8) & 0x1) << 10)
+        | (((p >> 7) & 0x1) << 6)
+        | (((p >> 6) & 0x1) << 7)
+        | (((p >> 3) & 0x7) << 1)
+        | (((p >> 2) & 0x1) << 5);
+    ((imm << 52) as i64) >> 52
+}
+
+/// CB offset (C.BEQZ/C.BNEZ): [12]=imm[8] (sign), [11:10]=imm[4:3],
+/// [6:5]=imm[7:6], [4:3]=imm[2:1], [2]=imm[5].
+fn imm_cb(parcel: u16) -> i64 {
+    let p = parcel as u64;
+    let imm = (((p >> 12) & 0x1) << 8)
+        | (((p >> 10) & 0x3) << 3)
+        | (((p >> 5) & 0x3) << 6)
+        | (((p >> 3) & 0x3) << 1)
+        | (((p >> 2) & 0x1) << 5);
+    ((imm << 55) as i64) >> 55
 }
 
 #[cfg(test)]
@@ -1521,6 +1613,107 @@ mod tests {
         assert_eq!(
             decode_compressed_checked(0b100_0_00000_00000_10, 0x8002),
             Err(Exception::IllegalInstruction(0x8002))
+        );
+    }
+
+    #[test]
+    fn decodes_compressed_quadrant1_immediates() {
+        // CI: funct3_imm[5]_rd_imm[4:0]_op (hex from binutils)
+        // c.addiw a0, -1
+        assert_eq!(
+            decode_compressed_checked(0b001_1_01010_11111_01, 0x357d).unwrap(),
+            Inst::Addiw { rd: 10, rs1: 10, imm: -1 }
+        );
+        // c.li a0, 21 = addi a0, x0, 21
+        assert_eq!(
+            decode_compressed_checked(0b010_0_01010_10101_01, 0x4555).unwrap(),
+            Inst::Addi { rd: 10, rs1: 0, imm: 21 }
+        );
+        // c.lui a1, 5 — the 6-bit immediate lands at bits 17:12
+        assert_eq!(
+            decode_compressed_checked(0b011_0_01011_00101_01, 0x6595).unwrap(),
+            Inst::Lui { rd: 11, imm: 0x5000 }
+        );
+        // c.addi16sp sp, -64 (rd=2 turns C.LUI's row into the sp adjuster;
+        // imm scatter [9]_[4]_[6]_[8:7]_[5], scaled by 16)
+        assert_eq!(
+            decode_compressed_checked(0b011_1_00010_0111_0_01, 0x7139).unwrap(),
+            Inst::Addi { rd: 2, rs1: 2, imm: -64 }
+        );
+        // c.addiw with rd=0 is reserved (RV32 would put C.JAL here)
+        assert_eq!(
+            decode_compressed_checked(0b001_1_00000_11111_01, 0x307d),
+            Err(Exception::IllegalInstruction(0x307d))
+        );
+    }
+
+    #[test]
+    fn decodes_compressed_quadrant1_arithmetic() {
+        // CB-form arithmetic: funct3_shamt[5]_funct2_rs1'_shamt[4:0]_op
+        // c.srli a1, 4 / c.srai a1, 4 / c.andi a1, -9
+        assert_eq!(
+            decode_compressed_checked(0b100_0_00_011_00100_01, 0x8191).unwrap(),
+            Inst::Srli { rd: 11, rs1: 11, shamt: 4 }
+        );
+        assert_eq!(
+            decode_compressed_checked(0b100_0_01_011_00100_01, 0x8591).unwrap(),
+            Inst::Srai { rd: 11, rs1: 11, shamt: 4 }
+        );
+        assert_eq!(
+            decode_compressed_checked(0b100_1_10_011_10111_01, 0x99dd).unwrap(),
+            Inst::Andi { rd: 11, rs1: 11, imm: -9 }
+        );
+        // CA-form: funct3_bit12_11_rd'_funct2_rs2'_op — all rd op= rs2
+        // c.sub / c.xor / c.or / c.and a1, a2
+        assert_eq!(
+            decode_compressed_checked(0b100_0_11_011_00_100_01, 0x8d91).unwrap(),
+            Inst::Sub { rd: 11, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode_compressed_checked(0b100_0_11_011_01_100_01, 0x8db1).unwrap(),
+            Inst::Xor { rd: 11, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode_compressed_checked(0b100_0_11_011_10_100_01, 0x8dd1).unwrap(),
+            Inst::Or { rd: 11, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode_compressed_checked(0b100_0_11_011_11_100_01, 0x8df1).unwrap(),
+            Inst::And { rd: 11, rs1: 11, rs2: 12 }
+        );
+        // bit 12 = 1 selects the W forms: c.subw / c.addw a1, a2
+        assert_eq!(
+            decode_compressed_checked(0b100_1_11_011_00_100_01, 0x9d91).unwrap(),
+            Inst::Subw { rd: 11, rs1: 11, rs2: 12 }
+        );
+        assert_eq!(
+            decode_compressed_checked(0b100_1_11_011_01_100_01, 0x9db1).unwrap(),
+            Inst::Addw { rd: 11, rs1: 11, rs2: 12 }
+        );
+        // (1, 10) and (1, 11) are reserved
+        assert_eq!(
+            decode_compressed_checked(0b100_1_11_011_10_100_01, 0x9dd1),
+            Err(Exception::IllegalInstruction(0x9dd1))
+        );
+    }
+
+    #[test]
+    fn decodes_compressed_quadrant1_control_flow() {
+        // CJ: funct3_[11]_[4]_[9:8]_[10]_[6]_[7]_[3:1]_[5]_op
+        // c.j . (offset 0: every immediate bit clear)
+        assert_eq!(
+            decode_compressed_checked(0b101_0_0_00_0_0_0_000_0_01, 0xa001).unwrap(),
+            Inst::Jal { rd: 0, offset: 0 }
+        );
+        // CB: funct3_[8]_[4:3]_rs1'_[7:6]_[2:1]_[5]_op
+        // c.beqz a1, -2 / c.bnez a1, -4 (backward: sign bit set)
+        assert_eq!(
+            decode_compressed_checked(0b110_1_11_011_11_11_1_01, 0xddfd).unwrap(),
+            Inst::Beq { rs1: 11, rs2: 0, offset: -2 }
+        );
+        assert_eq!(
+            decode_compressed_checked(0b111_1_11_011_11_10_1_01, 0xfdf5).unwrap(),
+            Inst::Bne { rs1: 11, rs2: 0, offset: -4 }
         );
     }
 

@@ -54,6 +54,19 @@ fn the_whole_rv64ua_p_suite_passes() {
 }
 
 #[test]
+fn the_whole_rv64uc_p_suite_passes() {
+    let failures: Vec<_> = suite("rv64uc-p-")
+        .into_iter()
+        .map(|name| {
+            let outcome = run_isa_test(&name);
+            (name, outcome)
+        })
+        .filter(|(_, outcome)| *outcome != Outcome::Pass)
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
 fn the_whole_rv64um_p_suite_passes() {
     let failures: Vec<_> = suite("rv64um-p-")
         .into_iter()
