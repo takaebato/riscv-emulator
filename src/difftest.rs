@@ -120,9 +120,6 @@ pub enum Divergence {
 pub enum DiffResult {
     /// Spike's whole log matched.
     Lockstep { instructions: u64 },
-    /// Everything up to the test's final ecall matched (see module docs:
-    /// the trap path diverges on mcause until phase 3 privilege modes).
-    LockstepUntilEcall { instructions: u64 },
     /// First disagreement, as an index into the event slice.
     Diverged { index: usize, kind: Divergence },
 }
@@ -163,10 +160,7 @@ pub fn run(cpu: &mut Cpu, events: &[Event]) -> DiffResult {
                     }
                 }
             }
-            Event::Trap { cause, .. } => {
-                if cause.contains("ecall") {
-                    return DiffResult::LockstepUntilEcall { instructions };
-                }
+            Event::Trap { .. } => {
                 match cpu.step() {
                     // Both trapped: follow Spike into the handler.
                     Err(e) => cpu.trap(&e),
@@ -287,20 +281,27 @@ core   0: >>>>  write_tohost
     }
 
     #[test]
-    fn stops_successfully_at_the_final_ecall() {
+    fn follows_spike_through_an_ecall_trap() {
+        // The ecall traps internally on our side (step returns Ok with pc
+        // at mtvec); the next commit's pc check confirms we entered the
+        // same handler Spike did.
         let mut cpu = cpu_with_program(&[0x00500093, 0x00000073]);
+        cpu.csrs[0x305] = DRAM_BASE + 0x40; // mtvec
+        cpu.bus.store32(DRAM_BASE + 0x40, 0x00100093).unwrap(); // addi x1, x0, 1
         let events = vec![
             Event::Commit { pc: DRAM_BASE, raw: 0x00500093, write: Some((1, 5)) },
             Event::Trap {
                 epc: DRAM_BASE + 4,
-                cause: "trap_user_ecall".to_string(),
+                cause: "trap_machine_ecall".to_string(),
                 tval: None,
             },
+            Event::Commit {
+                pc: DRAM_BASE + 0x40,
+                raw: 0x00100093,
+                write: Some((1, 1)),
+            },
         ];
-        assert_eq!(
-            run(&mut cpu, &events),
-            DiffResult::LockstepUntilEcall { instructions: 1 }
-        );
+        assert_eq!(run(&mut cpu, &events), DiffResult::Lockstep { instructions: 2 });
     }
 
     #[test]

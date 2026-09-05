@@ -54,6 +54,12 @@ fn the_whole_rv64ua_p_suite_passes() {
 }
 
 #[test]
+fn rv64mi_p_csr_passes() {
+    // The whole rv64mi-p directory joins as phase 3 features land.
+    assert_eq!(run_isa_test("rv64mi-p-csr"), Outcome::Pass);
+}
+
+#[test]
 fn the_whole_rv64uc_p_suite_passes() {
     let failures: Vec<_> = suite("rv64uc-p-")
         .into_iter()

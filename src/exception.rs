@@ -14,8 +14,10 @@ pub enum Exception {
     LoadAccessFault(u64),
     /// Store to outside the implemented memory range (shares its cause number with AMO)
     StoreAmoAccessFault(u64),
-    /// ECALL executed in machine mode (the only mode so far)
+    /// ECALL executed in machine mode
     EnvironmentCallFromMMode,
+    /// ECALL executed in user mode
+    EnvironmentCallFromUMode,
 }
 
 impl Exception {
@@ -27,6 +29,7 @@ impl Exception {
             Exception::Breakpoint => 3,
             Exception::LoadAccessFault(_) => 5,
             Exception::StoreAmoAccessFault(_) => 7,
+            Exception::EnvironmentCallFromUMode => 8,
             Exception::EnvironmentCallFromMMode => 11,
         }
     }
@@ -39,7 +42,9 @@ impl Exception {
             Exception::IllegalInstruction(raw) => *raw as u64,
             Exception::LoadAccessFault(addr) => *addr,
             Exception::StoreAmoAccessFault(addr) => *addr,
-            Exception::Breakpoint | Exception::EnvironmentCallFromMMode => 0,
+            Exception::Breakpoint
+            | Exception::EnvironmentCallFromMMode
+            | Exception::EnvironmentCallFromUMode => 0,
         }
     }
 }
@@ -56,6 +61,7 @@ impl std::fmt::Display for Exception {
                 write!(f, "store/AMO access fault at {addr:#x}")
             }
             Exception::EnvironmentCallFromMMode => write!(f, "environment call from M-mode"),
+            Exception::EnvironmentCallFromUMode => write!(f, "environment call from U-mode"),
         }
     }
 }

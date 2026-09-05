@@ -717,8 +717,10 @@ fn csr_exists(csr: usize) -> bool {
     matches!(csr,
         // machine information (read-only): mvendorid, marchid, mimpid, mhartid
         0xf11..=0xf14
-        // machine trap setup: mstatus, misa, medeleg, mideleg, mie, mtvec, mcounteren
-        | 0x300..=0x306
+        // machine trap setup: mstatus, misa, mie, mtvec, mcounteren.
+        // medeleg/mideleg (0x302/0x303) only exist alongside S mode:
+        // delegation needs somewhere to delegate to. They join with S.
+        | 0x300 | 0x301 | 0x304..=0x306
         // machine trap handling: mscratch, mepc, mcause, mtval, mip
         | 0x340..=0x344
         // supervisor address translation (written to 0 by the test env)

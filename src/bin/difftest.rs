@@ -23,7 +23,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // simulate the same choice instead of trapping (rv64ui-p-ma_data
     // exercises exactly this difference).
     let output = std::process::Command::new("spike")
-        .args(["--misaligned", "-l", "--log-commits", &path])
+        // --isa/--priv: simulate OUR machine (no F/D, no S mode yet), so
+        // misa and the tests' feature-dependent branches agree on both
+        // sides. S rejoins with the privilege-modes step.
+        .args([
+            "--isa=rv64imac_zicsr_zifencei",
+            "--priv=mu",
+            "--misaligned",
+            "-l",
+            "--log-commits",
+            &path,
+        ])
         .output()
         .map_err(|e| format!("cannot run spike: {e} (install per docs/setup.md)"))?;
     let log = String::from_utf8_lossy(&output.stderr);
@@ -42,13 +52,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match difftest::run(&mut cpu, events) {
         DiffResult::Lockstep { instructions } => {
             println!("lockstep OK: {instructions} instructions match spike");
-        }
-        DiffResult::LockstepUntilEcall { instructions } => {
-            println!(
-                "lockstep OK: {instructions} instructions match spike \
-                 (compared up to the final ecall; the trap path waits for \
-                 phase 3 privilege modes)"
-            );
         }
         DiffResult::Diverged { index, kind } => {
             println!("DIVERGED at event {index} (pc {:#x})\n", events[index].pc());

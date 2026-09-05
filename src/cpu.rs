@@ -6,6 +6,10 @@ use crate::exception::Exception;
 use crate::inst::{Inst, decode, decode_compressed};
 use crate::loader::LoadedElf;
 
+/// CSR address of mstatus (Machine STATUS): the machine's control panel —
+/// interrupt enables (MIE/MPIE), previous privilege (MPP), and hardwired
+/// configuration fields.
+const MSTATUS: usize = 0x300;
 /// CSR address of mtvec (Machine Trap VECtor): where traps jump to.
 const MTVEC: usize = 0x305;
 /// CSR address of mepc (Machine Exception Program Counter): where a trap saves
@@ -16,6 +20,13 @@ const MCAUSE: usize = 0x342;
 /// CSR address of mtval (Machine Trap VALue): extra evidence about the trap
 /// (faulting address, offending instruction word, ...).
 const MTVAL: usize = 0x343;
+
+/// Privilege levels, with the spec's encoding (S = 1 joins later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivilegeMode {
+    User = 0,
+    Machine = 3,
+}
 
 pub struct Cpu {
     /// Integer registers x0..=x31. x0 is always 0 (enforced at the end of execute).
@@ -35,16 +46,33 @@ pub struct Cpu {
     /// exists; interrupts (phase 3) land between instructions and leave it
     /// alone, matching the spec's allowance.
     pub reservation: Option<u64>,
+    /// Current privilege level. Boots in Machine; drops via MRET, rises
+    /// via traps. Part of the architectural state, though no CSR exposes
+    /// it directly (software infers it from how it got here).
+    pub privilege: PrivilegeMode,
     pub bus: Bus,
 }
 
 impl Cpu {
     pub fn new() -> Self {
+        let mut csrs = [0; 4096];
+        // mstatus reset value, matching Spike with M+U: UXL (bits 33:32)
+        // hardwired to 2 = 64-bit registers for U mode, MPIE set. SXL
+        // appears only once S mode exists — a mode's absence removes its
+        // fields, not just its instructions.
+        csrs[MSTATUS] = 0x0000_0002_0000_0080;
+        // misa: the machine introduces itself. MXL (bits 63:62) = 2 = 64-bit,
+        // extension bits I+M+A+C plus U. S joins when the privilege-modes
+        // step implements its CSRs (claiming a mode obliges its registers).
+        // Read-only here (writable misa — turning extensions off at runtime —
+        // is a legal but unimplemented luxury).
+        csrs[0x301] = (2 << 62) | 0x101105;
         Self {
             regs: [0; 32],
             pc: 0,
-            csrs: [0; 4096],
+            csrs,
             reservation: None,
+            privilege: PrivilegeMode::Machine,
             bus: Bus::new(),
         }
     }
@@ -69,12 +97,30 @@ impl Cpu {
     /// 32-bit instruction, anything else = compressed).
     pub fn fetch_decode(&self) -> Result<(Inst, u64, u32), Exception> {
         let parcel = self.bus.load16(self.pc)?;
-        if parcel & 0b11 == 0b11 {
+        let (inst, len, raw) = if parcel & 0b11 == 0b11 {
             let raw = self.bus.load32(self.pc)?;
-            Ok((decode(raw)?, 4, raw))
+            (decode(raw)?, 4, raw)
         } else {
-            Ok((decode_compressed(parcel)?, 2, parcel as u32))
+            (decode_compressed(parcel)?, 2, parcel as u32)
+        };
+        // Context-dependent legality: these decode fine but may not be
+        // allowed at the current privilege level. CSR addresses carry their
+        // minimum privilege in bits 9:8 (the address IS the permission
+        // table); MRET is a machine-mode instruction.
+        let allowed = match inst {
+            Inst::Csrrw { csr, .. }
+            | Inst::Csrrs { csr, .. }
+            | Inst::Csrrc { csr, .. }
+            | Inst::Csrrwi { csr, .. }
+            | Inst::Csrrsi { csr, .. }
+            | Inst::Csrrci { csr, .. } => (csr >> 8) & 0b11 <= self.privilege as usize,
+            Inst::Mret => self.privilege == PrivilegeMode::Machine,
+            _ => true,
+        };
+        if !allowed {
+            return Err(Exception::IllegalInstruction(raw));
         }
+        Ok((inst, len, raw))
     }
 
     /// One turn of the interpreter loop: fetch → decode → execute.
@@ -83,12 +129,37 @@ impl Cpu {
         self.execute(inst, len)
     }
 
+    /// Write a CSR, applying per-register semantics. Most CSRs are plain
+    /// storage (for now); mstatus is the first with WARL behavior — some
+    /// fields hardwired, one derived.
+    fn csr_write(&mut self, csr: usize, value: u64) {
+        match csr {
+            MSTATUS => {
+                // Writable fields: SIE, MIE, SPIE, MPIE, SPP, VS, MPP, FS,
+                // MPRV, SUM, MXR, TVM, TW, TSR. Everything else — notably
+                // UXL/SXL (bits 33:32/35:34, hardwired to 64-bit) — keeps
+                // its current value no matter what is written (WARL).
+                const WRITABLE: u64 = 0x7e7faa;
+                let mut v = (self.csrs[MSTATUS] & !WRITABLE) | (value & WRITABLE);
+                // SD (bit 63) is derived, not stored: set while FS or VS
+                // says "dirty" (0b11), so context switchers can test one
+                // sign bit to decide whether FP/vector state needs saving.
+                let dirty = (v >> 13) & 0b11 == 0b11 || (v >> 9) & 0b11 == 0b11;
+                v = (v & !(1 << 63)) | ((dirty as u64) << 63);
+                self.csrs[MSTATUS] = v;
+            }
+            // misa is WARL all the way down: this implementation hardwires it.
+            0x301 => {}
+            // mepc: bit 0 is hardwired zero (return targets are at least
+            // 2-byte aligned with the C extension).
+            MEPC => self.csrs[MEPC] = value & !1,
+            _ => self.csrs[csr] = value,
+        }
+    }
+
     /// Take a trap: record what happened in the CSRs and redirect pc to the
     /// handler. `self.pc` must still point at the instruction that trapped
     /// (execute guarantees this: pc is only committed on success).
-    ///
-    /// Still missing for phase 3: the mstatus MIE/MPIE/MPP shuffle (interrupt
-    /// masking and privilege tracking) that MRET will then undo.
     pub fn trap(&mut self, e: &Exception) {
         self.csrs[MEPC] = self.pc;
         self.csrs[MCAUSE] = e.cause();
@@ -98,6 +169,17 @@ impl Cpu {
             Exception::Breakpoint => self.pc,
             _ => e.tval(),
         };
+        // The mstatus stack pushes: the interrupt enable is stashed in MPIE
+        // and cleared (handlers start with interrupts off), the interrupted
+        // privilege is recorded in MPP, and the hart rises to M.
+        let mstatus = self.csrs[MSTATUS];
+        let mie = (mstatus >> 3) & 1;
+        let mut v = mstatus;
+        v = (v & !(1 << 7)) | (mie << 7); // MPIE = MIE
+        v &= !(1 << 3); // MIE = 0
+        v = (v & !(0b11 << 11)) | ((self.privilege as u64) << 11); // MPP = interrupted mode
+        self.csrs[MSTATUS] = v;
+        self.privilege = PrivilegeMode::Machine;
         // The low 2 bits of mtvec select direct vs vectored mode. Vectored
         // only affects interrupts (pc = base + 4 * cause); exceptions always
         // enter at base, so masking the mode bits off is correct here.
@@ -518,38 +600,38 @@ impl Cpu {
             // set/clear arms still guard on it so a plain read never dirties a CSR.
             Inst::Csrrw { rd, rs1, csr } => {
                 let old = self.csrs[csr];
-                self.csrs[csr] = self.regs[rs1];
+                self.csr_write(csr, self.regs[rs1]);
                 self.regs[rd] = old;
             }
             Inst::Csrrs { rd, rs1, csr } => {
                 let old = self.csrs[csr];
                 if rs1 != 0 {
-                    self.csrs[csr] = old | self.regs[rs1];
+                    self.csr_write(csr, old | self.regs[rs1]);
                 }
                 self.regs[rd] = old;
             }
             Inst::Csrrc { rd, rs1, csr } => {
                 let old = self.csrs[csr];
                 if rs1 != 0 {
-                    self.csrs[csr] = old & !self.regs[rs1];
+                    self.csr_write(csr, old & !self.regs[rs1]);
                 }
                 self.regs[rd] = old;
             }
             Inst::Csrrwi { rd, uimm, csr } => {
                 self.regs[rd] = self.csrs[csr];
-                self.csrs[csr] = uimm;
+                self.csr_write(csr, uimm);
             }
             Inst::Csrrsi { rd, uimm, csr } => {
                 let old = self.csrs[csr];
                 if uimm != 0 {
-                    self.csrs[csr] = old | uimm;
+                    self.csr_write(csr, old | uimm);
                 }
                 self.regs[rd] = old;
             }
             Inst::Csrrci { rd, uimm, csr } => {
                 let old = self.csrs[csr];
                 if uimm != 0 {
-                    self.csrs[csr] = old & !uimm;
+                    self.csr_write(csr, old & !uimm);
                 }
                 self.regs[rd] = old;
             }
@@ -557,7 +639,13 @@ impl Cpu {
             // semantics. trap() sets pc itself, so return before the commit
             // at the bottom would overwrite it with next_pc.
             Inst::Ecall => {
-                self.trap(&Exception::EnvironmentCallFromMMode);
+                // "Environment call from ..." — the cause names the caller,
+                // so the handler knows which world is asking.
+                let e = match self.privilege {
+                    PrivilegeMode::Machine => Exception::EnvironmentCallFromMMode,
+                    PrivilegeMode::User => Exception::EnvironmentCallFromUMode,
+                };
+                self.trap(&e);
                 return Ok(());
             }
             Inst::Ebreak => {
@@ -569,10 +657,28 @@ impl Cpu {
             // Fetch always reads DRAM directly (no icache to flush): see the
             // enum doc. The self-modifying-code test below proves it holds.
             Inst::FenceI => {}
-            // Minimal MRET: just the jump back to mepc. Restoring the privilege
-            // level and interrupt-enable state comes with phase 3, along with
-            // clearing the low bits of mepc (guaranteed aligned in practice here).
+            // MRET: return from the trap handler. The mstatus stack pops:
+            // the hart drops to MPP's mode, MIE comes back from MPIE, MPIE
+            // re-arms to 1, MPP resets to the least-privileged mode (U),
+            // and MPRV is cleared when leaving M (its address-translation
+            // override must not leak to less-privileged code).
             Inst::Mret => {
+                let mstatus = self.csrs[MSTATUS];
+                let mpp = (mstatus >> 11) & 0b11;
+                self.privilege = if mpp == 0b11 {
+                    PrivilegeMode::Machine
+                } else {
+                    PrivilegeMode::User
+                };
+                let mpie = (mstatus >> 7) & 1;
+                let mut v = mstatus;
+                v = (v & !(1 << 3)) | (mpie << 3); // MIE = MPIE
+                v |= 1 << 7; // MPIE = 1
+                v &= !(0b11 << 11); // MPP = U
+                if mpp != 0b11 {
+                    v &= !(1 << 17); // MPRV = 0
+                }
+                self.csrs[MSTATUS] = v;
                 next_pc = self.csrs[MEPC];
             }
         }
@@ -1114,6 +1220,57 @@ mod tests {
         cpu.step().unwrap();
         assert_eq!(cpu.csrs[MCAUSE], 3, "breakpoint");
         assert_eq!(cpu.csrs[MTVAL], DRAM_BASE, "mtval holds the ebreak's address");
+    }
+
+    #[test]
+    fn mret_drops_to_user_and_ecall_reports_cause_8() {
+        // mret with MPP=U (the reset value), then an ecall from user mode:
+        // the cause names the calling world (8, not 11), the trap rises
+        // back to M, and MPP records where the hart was interrupted.
+        let mut cpu = cpu_with_program(&[0x30200073, 0x00000073]); // mret; ecall
+        cpu.csrs[MEPC] = DRAM_BASE + 4;
+        cpu.csrs[MTVEC] = DRAM_BASE + 0x40;
+        cpu.step().unwrap();
+        assert_eq!(cpu.privilege, PrivilegeMode::User, "mret dropped to U");
+        cpu.step().unwrap();
+        assert_eq!(cpu.csrs[MCAUSE], 8, "environment call from U-mode");
+        assert_eq!(cpu.privilege, PrivilegeMode::Machine, "trap rose to M");
+        assert_eq!((cpu.csrs[MSTATUS] >> 11) & 0b11, 0, "MPP recorded U");
+    }
+
+    #[test]
+    fn user_mode_cannot_touch_machine_csrs() {
+        // After dropping to U, reading mstatus (csr 0x300: privilege M in
+        // address bits 9:8) is illegal — the address is the permission.
+        let mut cpu = cpu_with_program(&[0x30200073, 0x300022f3]); // mret; csrr t0, mstatus
+        cpu.csrs[MEPC] = DRAM_BASE + 4;
+        cpu.step().unwrap();
+        assert_eq!(cpu.step(), Err(Exception::IllegalInstruction(0x300022f3)));
+    }
+
+    #[test]
+    fn trap_and_mret_shuffle_the_mstatus_stack() {
+        // MIE on; ecall pushes (MPIE <- MIE, MIE <- 0), mret pops (MIE <-
+        // MPIE) and returns to mepc.
+        let mut cpu = cpu_with_program(&[0x00000073]); // ecall
+        cpu.csrs[MSTATUS] |= 1 << 3; // MIE
+        cpu.csrs[MTVEC] = DRAM_BASE + 0x40;
+        cpu.bus.store32(DRAM_BASE + 0x40, 0x30200073).unwrap(); // handler: mret
+        cpu.step().unwrap();
+        assert_eq!((cpu.csrs[MSTATUS] >> 3) & 1, 0, "MIE off in the handler");
+        assert_eq!((cpu.csrs[MSTATUS] >> 7) & 1, 1, "old MIE stashed in MPIE");
+        cpu.step().unwrap();
+        assert_eq!((cpu.csrs[MSTATUS] >> 3) & 1, 1, "MIE restored by mret");
+        assert_eq!(cpu.pc, DRAM_BASE, "back at mepc");
+    }
+
+    #[test]
+    fn mstatus_hardwired_fields_survive_writes() {
+        // csrw mstatus, x0: a full overwrite with zero, yet UXL (bits
+        // 33:32) still reads 2 — WARL fields keep their own counsel.
+        let mut cpu = cpu_with_program(&[0x30001073]);
+        cpu.step().unwrap();
+        assert_eq!((cpu.csrs[MSTATUS] >> 32) & 0b11, 2, "UXL hardwired to 64-bit");
     }
 
     #[test]
